@@ -9,7 +9,11 @@ all: sockv
 sockv: sockv.c
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
+test: all
+	@t/run.sh
+
 clean:
 	rm -f sockv
+	rm -rf t/tmp
 
-.PHONY: all clean
+.PHONY: all test clean
