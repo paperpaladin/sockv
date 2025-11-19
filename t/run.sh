@@ -57,8 +57,8 @@ if ! "$S" -tl >/dev/null 2>"$TD/why"; then
 	echo "Likely CONFIG_INET_DIAG=n, or a seccomp or netlink restriction in"
 	echo "whatever this is running inside. Every assertion below needs the"
 	echo "kernel to be the oracle, so they are SKIPPED, not passed."
-	for n in tcp-udp-all tcp-udp-all-teeth tcp-udp-listen \
-	         tcp-udp-listen-teeth no-duplicate-rows; do
+	for n in tcp-udp-all tcp-udp-listen unix-all unix-listen all-families \
+	         family-partition no-duplicate-rows; do
 		skipt "$n" "no sock_diag"
 	done
 	printf '\n%d passed, %d failed, %d skipped\n' "$pass" "$fail" "$skip"
@@ -69,16 +69,23 @@ HAVE_SS=yes
 command -v ss >/dev/null 2>&1 || HAVE_SS=no
 
 # ===========================================================================
-# normalisers: reduce both programs to the same six fields, one row per socket
+# normalisers: reduce both programs to the same fields, one row per socket
 # ===========================================================================
-# sockv prints  FAMILY NETID STATE LOCAL PEER INODE UID, so dropping the
-# family column leaves exactly what ss -e reports.
-sockv_rows() { "$S" "$@" | awk '{print $2, $3, $4, $5, $6, $7}' | sort; }
+# sockv prints  FAMILY NETID STATE LOCAL PEER INODE UID. Dropping the family
+# column leaves exactly what ss reports. Two projections, because ss's -e
+# output gives uid for inet sockets and not for UNIX ones.
+my6() { "$S" "$@" | awk '{print $2, $3, $4, $5, $6, $7}' | sort; }
+my5() { "$S" "$@" | awk '{print $2, $3, $4, $5, $6}'     | sort; }
 
-# ss -tuanHe prints  netid state recvq sendq local peer, then a bag of
-# key:value tokens. uid and inode are picked out by prefix rather than by
-# position, because the bag's contents vary with kernel and cgroup.
-ss_rows_inet() {
+# ss prints  netid state recvq sendq local peer  and then, for inet sockets, a
+# bag of key:value tokens. uid and inode come out of that bag by prefix rather
+# than by position, because its contents vary with kernel and cgroup.
+#
+# A UNIX row is shaped differently: $5 is the name, $6 the socket's own inode
+# (ss calls it the Port), $7 is always "*" and $8 the peer's inode. sockv
+# joins those into name:inode and *:peer-inode so both kinds of row compare
+# the same way.
+ss6() {
 	ss "$@" 2>/dev/null | awk '
 		{
 			u = ""; n = ""
@@ -90,19 +97,39 @@ ss_rows_inet() {
 			print $1, $2, $5, $6, n, u
 		}' | sort
 }
+ss5() {
+	ss "$@" 2>/dev/null | awk -v unp="$TD/unparsed" '
+		$1 ~ /^u_/ {
+			# A socket name containing whitespace shifts every
+			# field after it, in ss as much as in sockv. Such rows
+			# are counted and reported, never quietly dropped.
+			if (NF < 8 || $6 !~ /^[0-9]+$/ || $8 !~ /^[0-9]+$/) {
+				bad++; next
+			}
+			print $1, $2, $5 ":" $6, $7 ":" $8, $6
+			next
+		}
+		{
+			n = ""
+			for (i = 7; i <= NF; i++)
+				if ($i ~ /^ino:/) n = substr($i, 5)
+			print $1, $2, $5, $6, n
+		}
+		END { if (bad) print bad > unp }' | sort
+}
 
 # ===========================================================================
 # the differential: both directions, with a count that proves it had teeth
 # ===========================================================================
-# difftest NAME MINROWS SOCKV_ARGS SS_ARGS
+# difftest NAME MINROWS SOCKV_ARGS SS_ARGS NFIELDS
 difftest() {
-	_n=$1; _min=$2; _sa=$3; _ssa=$4
+	_n=$1; _min=$2; _sa=$3; _ssa=$4; _nf=$5
 	_try=0
 	while [ "$_try" -lt 4 ]; do
 		_try=$((_try + 1))
-		ss_rows_inet $_ssa                > "$TD/before"
-		sockv_rows $_sa                   > "$TD/mine"
-		ss_rows_inet $_ssa                > "$TD/after"
+		"ss$_nf" $_ssa                    > "$TD/before"
+		"my$_nf" $_sa                     > "$TD/mine"
+		"ss$_nf" $_ssa                    > "$TD/after"
 		# sockets ss saw on both sides of our window
 		comm -12 "$TD/before" "$TD/after" > "$TD/stable"
 		sort -u "$TD/before" "$TD/after"  > "$TD/either"
@@ -113,16 +140,16 @@ difftest() {
 	_c=$(wc -l < "$TD/stable" | tr -d ' ')
 	if [ -s "$TD/missing" ] || [ -s "$TD/extra" ]; then
 		bad "$_n: ss agrees both ways" \
-		    "after $_try attempts, with $_c sockets stable across the window" \
+		    "after $_try attempts, $_c sockets stable across the window" \
 		    "ss reported and sockv did not:" \
-		    "$(sed 's/^/  /' "$TD/missing")" \
+		    "$(head -20 "$TD/missing" | sed 's/^/  /')" \
 		    "sockv reported and ss did not:" \
-		    "$(sed 's/^/  /' "$TD/extra")"
+		    "$(head -20 "$TD/extra" | sed 's/^/  /')"
 	else
 		ok "$_n: ss agrees both ways ($_c sockets)"
 	fi
-	# A set comparison of two empty sets passes. This is the assertion that
-	# stops that from counting.
+	# Two empty sets compare equal. This is the assertion that stops that
+	# from counting as agreement.
 	if [ "$_c" -ge "$_min" ]; then
 		ok "$_n: compared $_c sockets (>= $_min)"
 	else
@@ -134,53 +161,74 @@ difftest() {
 if [ "$HAVE_SS" = no ]; then
 	echo "iproute2's ss is not installed; the differential tests have no"
 	echo "independent reader to compare against and are SKIPPED."
-	for n in tcp-udp-all tcp-udp-all-teeth tcp-udp-listen \
-	         tcp-udp-listen-teeth; do
+	for n in 'tcp+udp, all states' 'tcp+udp, listening' \
+	         'unix, all states' 'unix, listening' \
+	         'tcp+udp+unix together'; do
 		skipt "$n" "no ss(8)"
+		skipt "$n: teeth" "no ss(8)"
 	done
 else
 	echo "sockv vs $(ss --version 2>/dev/null) on $(uname -r)"
 	echo
-	# Both ss commands keep the Netid column, which ss only prints when it
-	# is asked for more than one family. `ss -tanHe` drops it and shifts
-	# every field, so the single-family cases are checked below against the
-	# combined run instead of against a second, differently-shaped parser.
-	difftest 'tcp+udp, all states' 4 '-tu'  '-tuanHe'
-	difftest 'tcp+udp, listening'  1 '-tul' '-tulnHe'
+	# ss only prints its Netid column when asked for more than one family,
+	# so every ss command here asks for at least two. `ss -tanHe` drops the
+	# column and shifts every field, and a second differently-shaped parser
+	# would be a second place to be wrong.
+	difftest 'tcp+udp, all states'    4 '-tu'  '-tuanHe'  6
+	difftest 'tcp+udp, listening'     1 '-tul' '-tulnHe'  6
+	difftest 'unix, all states'       4 '-x'   '-xanHe'   5
+	difftest 'unix, listening'        1 '-xl'  '-xlnHe'   5
+	# All three families from one invocation of each program: proves the
+	# three dumps compose on one netlink socket and that nothing is lost
+	# when they run back to back.
+	difftest 'tcp+udp+unix together'  8 '-tux' '-tuxanHe' 5
+
+	if [ -s "$TD/unparsed" ]; then
+		skipt 'socket names containing whitespace' \
+		    "$(cat "$TD/unparsed") ss rows would not split into fields"
+	fi
 fi
 
 # ===========================================================================
-# -t and -u select, and together they partition -tu
+# -t, -u and -x select, and together they partition the default listing
 # ===========================================================================
 # Self-consistency, not an oracle: it catches an option-parsing mistake, which
-# is the one thing the differential above cannot see because it always asks
-# both programs for the same two families.
+# the differentials above cannot see because they always ask both programs for
+# the same families.
 _try=0
 while [ "$_try" -lt 4 ]; do
 	_try=$((_try + 1))
-	sockv_rows -tu > "$TD/both"
-	sockv_rows -t  > "$TD/justt"
-	sockv_rows -u  > "$TD/justu"
-	sort -u "$TD/justt" "$TD/justu" > "$TD/union"
-	cmp -s "$TD/both" "$TD/union" && break
+	my6 > "$TD/all"
+	my6 -t > "$TD/jt"
+	my6 -u > "$TD/ju"
+	my6 -x > "$TD/jx"
+	sort -u "$TD/jt" "$TD/ju" "$TD/jx" > "$TD/union"
+	cmp -s "$TD/all" "$TD/union" && break
 done
-if cmp -s "$TD/both" "$TD/union"; then
-	ok "-t and -u partition -tu ($(wc -l < "$TD/both" | tr -d ' ') rows)"
+if cmp -s "$TD/all" "$TD/union"; then
+	ok "-t -u -x partition the default listing ($(wc -l < "$TD/all" | tr -d ' ') rows)"
 else
-	bad '-t and -u partition -tu' "$(diff "$TD/both" "$TD/union" | sed 's/^/  /')"
+	bad '-t -u -x partition the default listing' \
+	    "$(diff "$TD/all" "$TD/union" | head -20 | sed 's/^/  /')"
 fi
-if [ "$(awk '$1 != "tcp"' "$TD/justt" | wc -l)" -eq 0 ] &&
-   [ "$(awk '$1 != "udp"' "$TD/justu" | wc -l)" -eq 0 ]; then
-	ok '-t yields only tcp rows and -u only udp rows'
+if [ "$(awk '$1 != "tcp"' "$TD/jt" | wc -l)" -eq 0 ] &&
+   [ "$(awk '$1 != "udp"' "$TD/ju" | wc -l)" -eq 0 ] &&
+   [ "$(awk '$1 !~ /^u_/' "$TD/jx" | wc -l)" -eq 0 ]; then
+	ok 'each family flag yields only its own netids'
 else
-	bad '-t yields only tcp rows and -u only udp rows'
+	bad 'each family flag yields only its own netids'
 fi
 
+# ss -e reports no uid for a UNIX socket, so the differential above compares
+# five fields there rather than six. Saying so out loud beats comparing five
+# fields and calling it six.
+skipt 'unix uid against ss' 'ss -e does not report uid for unix sockets'
+
 # ===========================================================================
-# a socket reported twice is a defect the set comparison above cannot see,
-# because comparing sets throws duplicates away
+# a socket reported twice is a defect the set comparisons cannot see, because
+# comparing sets throws duplicates away
 # ===========================================================================
-"$S" -tu | sort | uniq -d > "$TD/dup"
+"$S" | sort | uniq -d > "$TD/dup"
 if [ -s "$TD/dup" ]; then
 	bad 'no duplicate rows' "$(sed 's/^/  /' "$TD/dup")"
 else
@@ -193,7 +241,7 @@ fi
 t 'unknown option'            3  -- "$S" -Z
 t 'stray argument'            3  -- "$S" tcp
 t '--help exits 0'            0  -- "$S" --help
-t 'listing exits 0'           0  -- "$S" -tu
+t 'listing exits 0'           0  -- "$S" -tux
 
 printf '\n%d passed, %d failed, %d skipped\n' "$pass" "$fail" "$skip"
 [ "$fail" -eq 0 ]
