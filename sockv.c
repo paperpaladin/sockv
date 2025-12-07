@@ -673,6 +673,66 @@ static int dump_unix(struct dump *d, uint32_t states)
 	return run_dump(d, &req, sizeof req);
 }
 
+/*
+ * --parse exposes the walker to bytes no kernel would send. It is the same
+ * walk() the live path uses, over the same handlers, so a bounds check that
+ * the fixtures prove is the bounds check that runs against the kernel.
+ */
+static int parse_file(const char *proto, const char *path)
+{
+	struct dump d;
+	unsigned char *buf;
+	size_t cap = 1u << 20, len;
+	FILE *f;
+	int r;
+
+	memset(&d, 0, sizeof d);
+	if (!strcmp(proto, "tcp") || !strcmp(proto, "udp")) {
+		d.show = show_inet;
+		d.netid = proto;
+	} else if (!strcmp(proto, "unix")) {
+		d.show = show_unix;
+	} else {
+		fprintf(stderr, "%s: --parse: PROTO must be tcp, udp or unix, "
+		    "not '%s'\n", prog, proto);
+		return EX_USAGE;
+	}
+
+	f = fopen(path, "rb");
+	if (!f) {
+		fail("%s: %s", path, strerror(errno));
+		return EX_FAIL;
+	}
+	buf = malloc(cap);
+	if (!buf) {
+		fclose(f);
+		fail("out of memory");
+		return EX_FAIL;
+	}
+	len = fread(buf, 1, cap, f);
+	if (ferror(f)) {
+		fclose(f);
+		free(buf);
+		fail("%s: read: %s", path, strerror(errno));
+		return EX_FAIL;
+	}
+	fclose(f);
+
+	r = walk(buf, len, &d);
+	free(buf);
+	if (r == -1) return EX_BAD;
+	if (r < 0) return EX_FAIL;
+	/* On the live path NLM_F_DUMP_INTR means "ask again". There is nothing
+	 * to ask here, so it is reported rather than silently truncating the
+	 * listing at the flagged record. */
+	if (d.intr) {
+		fail("%s: a record carries NLM_F_DUMP_INTR; this capture is "
+		    "an incomplete dump", path);
+		return EX_FAIL;
+	}
+	return EX_OK;
+}
+
 /* --------------------------------------------------------------------- CLI */
 
 /*
@@ -687,7 +747,7 @@ static int dump_unix(struct dump *d, uint32_t states)
 static void usage(FILE *f)
 {
 	fprintf(f,
-	    "usage: %s [-tux] [-l | -a]\n"
+	    "usage: %s [-tux] [-l | -a] | %s --parse PROTO FILE\n"
 	    "\n"
 	    "  -t       TCP sockets          -l   listening only\n"
 	    "  -u       UDP sockets          -a   all states (the default)\n"
@@ -695,11 +755,16 @@ static void usage(FILE *f)
 	    "\n"
 	    "With no family flag, all of -t -u -x are listed.\n"
 	    "\n"
+	    "  --parse PROTO FILE   walk FILE as a captured netlink reply and\n"
+	    "                       list what it holds. PROTO is tcp, udp or\n"
+	    "                       unix. Same walker as the live path, exposed\n"
+	    "                       so it can be fed bytes no kernel would send.\n"
+	    "\n"
 	    "One row per socket, no header:\n"
 	    "  FAMILY NETID STATE LOCAL PEER INODE UID\n"
 	    "Exit: 0 listed, 1 syscall or kernel error, 2 malformed reply,\n"
 	    "3 usage.\n",
-	    prog);
+	    prog, prog);
 }
 
 int main(int argc, char **argv)
@@ -716,6 +781,14 @@ int main(int argc, char **argv)
 		if (!strcmp(a, "-h") || !strcmp(a, "--help")) {
 			usage(stdout);
 			return EX_OK;
+		}
+		if (!strcmp(a, "--parse")) {
+			if (i + 2 >= argc) {
+				fprintf(stderr,
+				    "%s: --parse needs PROTO and FILE\n", prog);
+				return EX_USAGE;
+			}
+			return parse_file(argv[i + 1], argv[i + 2]);
 		}
 		if (a[0] == '-' && a[1] && a[1] != '-') {
 			const char *c;

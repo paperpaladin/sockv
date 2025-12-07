@@ -236,6 +236,151 @@ else
 fi
 
 # ===========================================================================
+# the record walker, driven with bytes no kernel would send
+# ===========================================================================
+# This is the other half of the oracle and it is not a differential: the
+# fixtures are built by t/probe with values chosen there, so the expected row
+# is known exactly rather than compared against whatever the machine runs.
+# That matters twice over -- it pins the rendering rules the live system does
+# not happen to exercise (a v4-mapped address, a dual-stack wildcard, an
+# abstract name with no NUL terminator), and it is the only way to feed the
+# walker a record that lies about its own length.
+#
+# --parse runs the same walk() over the same handlers as the live path, so a
+# bounds check these fixtures prove is the bounds check the kernel meets.
+P="$ROOT/t/probe"
+TO=
+command -v timeout >/dev/null 2>&1 && TO="timeout 10"
+
+if [ ! -x "$P" ]; then
+	skipt 'record walker fixtures' 'run make: t/probe is not built'
+else
+	# pok NAME PROTO CASE ROW...   exit 0 and exactly these rows
+	pok() {
+		_n=$1; _p=$2; _c=$3; shift 3
+		if ! "$P" emit "$_c" "$TD/f.bin" 2>"$TD/e"; then
+			bad "$_n" "probe emit $_c failed" "$(cat "$TD/e")"
+			return
+		fi
+		_got=$($TO "$S" --parse "$_p" "$TD/f.bin" 2>"$TD/e" |
+		       awk 'NF {print $1, $2, $3, $4, $5, $6, $7}')
+		_s=$?
+		_want=$(printf '%s\n' "$@")
+		if [ "$_s" -eq 0 ] && [ "$_got" = "$_want" ]; then ok "$_n"
+		else bad "$_n" "want exit 0 and" "$_want" \
+		         "got exit $_s and" "$_got" "$(cat "$TD/e")"; fi
+	}
+
+	# pbad NAME PROTO CASE WANT_STATUS MSG   nonzero exit, and the
+	# diagnostic must name the field that was wrong -- a test that only
+	# checks the status cannot tell one bounds check from another, or from
+	# a typo in the parser.
+	pbad() {
+		_n=$1; _p=$2; _c=$3; _w=$4; _m=$5
+		if ! "$P" emit "$_c" "$TD/f.bin" 2>"$TD/e"; then
+			bad "$_n" "probe emit $_c failed" "$(cat "$TD/e")"
+			return
+		fi
+		_e=$($TO "$S" --parse "$_p" "$TD/f.bin" 2>&1 >/dev/null)
+		_s=$?
+		if [ "$_s" -eq "$_w" ] && printf '%s' "$_e" | grep -qF "$_m"
+		then ok "$_n"
+		else bad "$_n" "want exit $_w and stderr naming [$_m]" \
+		         "got exit $_s: $_e"; fi
+	}
+
+	# --- well formed: the rendering rules, pinned to known values ---
+	pok 'v4 endpoint' tcp v4 \
+	    'inet tcp ESTAB 127.0.0.1:8080 10.0.0.1:443 4242 1001'
+	pok 'v4 listener and %ifname scope' tcp v4-listen-scoped \
+	    'inet tcp LISTEN 127.0.0.53%lo:53 0.0.0.0:* 4243 65534'
+	pok 'v6 endpoint in brackets' tcp v6 \
+	    'inet6 tcp ESTAB [2001:db8::1]:8080 [2001:db8::2]:443 4244 1001'
+	pok 'v6 wildcard, v6only, prints [::]' tcp v6-wild-v6only \
+	    'inet6 tcp LISTEN [::]:8080 [::]:* 4245 0'
+	pok 'v6 wildcard, dual stack, prints *' tcp v6-wild-dual \
+	    'inet6 tcp LISTEN *:8080 *:* 4246 0'
+	pok 'v4-mapped address on a v6 socket' tcp v6-mapped \
+	    'inet6 tcp LISTEN [::ffff:127.0.0.1]:8080 *:* 4247 0'
+	pok 'udp netid comes from the request' udp v4 \
+	    'inet udp ESTAB 127.0.0.1:8080 10.0.0.1:443 4242 1001'
+	pok 'unix filesystem path' unix unix-path \
+	    'unix u_str LISTEN /run/probe.sock:4248 *:0 4248 1001'
+	pok 'unix abstract name as @name' unix unix-abstract \
+	    'unix u_dgr UNCONN @probe-abstract:4249 *:0 4249 1001'
+	pok 'unix unnamed, with a peer inode' unix unix-unnamed \
+	    'unix u_seq ESTAB *:4250 *:4251 4250 1001'
+	# The name here has no NUL terminator at all, so printing eleven
+	# characters instead of ten is an overread by one.
+	pok 'unix name bounded by nla_len, not by a NUL' unix unix-name-no-nul \
+	    'unix u_str LISTEN abcdefghij:4252 *:0 4252 1001'
+	pok 'two records in one datagram' tcp two-records \
+	    'inet tcp ESTAB 127.0.0.1:1 127.0.0.2:2 5001 1001' \
+	    'inet tcp ESTAB 127.0.0.3:3 127.0.0.4:4 5002 1001'
+	# An attribute type newer than this build knows must be skipped, not
+	# refused: the kernel grows that enum every few releases.
+	pok 'unknown attribute type is ignored' tcp attr-type-unknown \
+	    'inet tcp ESTAB 127.0.0.1:8080 10.0.0.1:443 4242 1001'
+	# nlmsg_len that is not a multiple of four. Every length a kernel emits
+	# is already aligned, so this is the only way to tell a walker that
+	# advances by NLMSG_ALIGN(nlmsg_len) from one that advances by
+	# nlmsg_len -- and the second one silently loses the next record.
+	pok 'unaligned nlmsg_len keeps the next record' unix unaligned-len \
+	    'unix u_str LISTEN /run/ab.sock:5003 *:0 5003 0' \
+	    'unix u_str LISTEN /run/c.sock:5004 *:0 5004 1001'
+
+	# --- malformed: refused, by name --------------------------------
+	pbad 'buffer shorter than an nlmsghdr' tcp short-buffer 2 \
+	    '9 trailing bytes, too few for an nlmsghdr'
+	pbad 'nlmsg_len below the header size' tcp len-under 2 \
+	    'nlmsg_len 8 is below the 16-byte nlmsghdr'
+	# A zero nlmsg_len is the one that spins a careless walker forever
+	# rather than overreading, which is why it is timed out above.
+	pbad 'nlmsg_len of zero' tcp len-zero 2 \
+	    'nlmsg_len 0 is below the 16-byte nlmsghdr'
+	pbad 'nlmsg_len past the end of the buffer' tcp len-over 2 \
+	    'overruns the 88 bytes left in the reply'
+	pbad 'nlmsg_len of 0xffffffff does not wrap' tcp len-huge 2 \
+	    'nlmsg_len 4294967295 overruns'
+	pbad 'truncated final record' tcp trailing-bytes 2 \
+	    '7 trailing bytes, too few for an nlmsghdr'
+	pbad 'payload too small for inet_diag_msg' tcp payload-short 2 \
+	    'carries 8 payload bytes, inet_diag_msg needs 72'
+	pbad 'nla_len below the attribute header' tcp attr-len-under 2 \
+	    'nla_len 2 is below the 4-byte attribute header'
+	pbad 'nla_len past the end of its message' tcp attr-len-over 2 \
+	    'nla_len 512 overruns the 8 bytes left in this message'
+	pbad 'attribute area ends mid-header' tcp attr-truncated 2 \
+	    '3 trailing bytes after the last attribute'
+	pbad 'u8 attribute with no payload' tcp attr-empty-u8 2 \
+	    'attribute 11 carries 0 bytes, needs 1'
+	pbad 'unix name longer than sun_path' unix unix-name-too-long 2 \
+	    'UNIX_DIAG_NAME is 200 bytes'
+	pbad 'address family we never asked for' tcp bad-family 2 \
+	    'idiag_family 99 is neither AF_INET'
+	pbad 'nlmsg_type we never asked for' tcp unknown-msg-type 2 \
+	    'unexpected nlmsg_type 1234'
+
+	# --- not malformed, but not a listing either --------------------
+	pbad 'NLMSG_ERROR is reported with its errno' tcp nlmsg-error 1 \
+	    'kernel refused the request: Operation not permitted'
+	pbad 'NLMSG_ERROR with no room for an errno' tcp nlmsg-error-empty 2 \
+	    'NLMSG_ERROR with no error code'
+	# On the live path this means "ask the kernel again"; replayed from a
+	# file there is nothing to ask, so it is reported rather than quietly
+	# truncating the listing at the flagged record.
+	pbad 'NLM_F_DUMP_INTR is not a listing' tcp dump-intr 1 \
+	    'carries NLM_F_DUMP_INTR'
+
+	t '--parse with an unknown protocol'  3 -- "$S" --parse sctp /dev/null
+	t '--parse with a missing file'       1 -- "$S" --parse tcp "$TD/nope"
+	t '--parse with no arguments'         3 -- "$S" --parse
+	# An empty reply is not malformed: it is a dump with nothing in it.
+	: > "$TD/empty.bin"
+	t '--parse of an empty file'          0 -- "$S" --parse tcp "$TD/empty.bin"
+fi
+
+# ===========================================================================
 # the command line fails closed
 # ===========================================================================
 t 'unknown option'            3  -- "$S" -Z
