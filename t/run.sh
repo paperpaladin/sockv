@@ -381,6 +381,100 @@ else
 fi
 
 # ===========================================================================
+# sockets this suite made itself, so it knows the answer before it asks
+# ===========================================================================
+# The third oracle, and the only one that is not a comparison: t/probe binds
+# and connects sockets whose address, state and type it chose, reads each
+# one's inode straight out of fstat(2) on its own descriptor -- the same
+# number the kernel reports as idiag_inode -- and prints the exact row sockv
+# must produce. The addresses it prints come from the numbers it passed to
+# bind(2), not from rendering a sockaddr back out, so it cannot share a
+# formatting mistake with sockv.
+#
+# This is what makes a failure specific. The differential can only ever say
+# "these sets differ"; these assertions say which socket and which field.
+if [ ! -x "$P" ]; then
+	skipt 'sockets created by the suite' 'run make: t/probe is not built'
+else
+	# Five consecutive ports, and a base unlikely to collide with whatever
+	# else is on the machine or with a concurrent run of this suite.
+	PORT=$((47000 + ($$ % 400) * 8))
+	mkdir -p "$TD/un"
+	"$P" hold "$PORT" "$TD/un" 30 > "$TD/inv" 2>"$TD/inverr" &
+	HOLD=$!
+	_i=0
+	while [ "$_i" -lt 200 ] && ! grep -q '^READY$' "$TD/inv" 2>/dev/null; do
+		_i=$((_i + 1))
+		sleep 0.05
+	done
+	if ! grep -q '^READY$' "$TD/inv" 2>/dev/null; then
+		bad 'the probe brought its sockets up' \
+		    "$(cat "$TD/inv" "$TD/inverr" 2>/dev/null)"
+	else
+		ok "the probe brought its sockets up (ports $PORT..$((PORT + 4)))"
+		"$S" -tux | awk '{print $1, $2, $3, $4, $5, $6, $7}' |
+			sort > "$TD/live"
+		while read -r _kw _tag _rest; do
+			case $_kw in
+			EXPECT)
+				if grep -qxF "$_rest" "$TD/live"; then
+					ok "created: $_tag"
+				else
+					bad "created: $_tag" \
+					    "this row is not in sockv's output:" \
+					    "  $_rest" \
+					    "sockv says of that inode:" \
+					    "$(awk -v i="${_rest##* }" \
+					        '$6 == i || $7 == i' "$TD/live" |
+					       sed 's/^/  /')"
+				fi ;;
+			SKIP)
+				skipt "created: $_tag" "$_rest" ;;
+			esac
+		done < "$TD/inv"
+
+		# A socket name with whitespace in it shifts every field after
+		# it, in sockv's output and in ss's alike, so this one is
+		# matched as a substring. The point is that the name reaches
+		# the output verbatim and bounded, not that it can be parsed.
+		_sp=$(sed -n 's/^SPACED //p' "$TD/inv")
+		if [ -z "$_sp" ]; then
+			skipt 'unix name containing spaces' \
+			    'the probe could not bind it'
+		elif "$S" -x | grep -qF "$_sp"; then
+			ok 'unix name containing spaces appears verbatim'
+		else
+			bad 'unix name containing spaces appears verbatim' \
+			    "looked for [$_sp]"
+		fi
+
+		# The differential's socket counts only prove something if the
+		# sockets with known identities are inside the population being
+		# compared. This is that assertion.
+		if [ "$HAVE_SS" = yes ]; then
+			{ ss6 -tuanHe | awk '{print $5}'
+			  ss5 -xanHe  | awk '{print $5}'; } |
+				sort -u > "$TD/ssino"
+			_tot=0; _miss=0
+			for _i in $(awk '$1 == "EXPECT" {print $8}' "$TD/inv"); do
+				_tot=$((_tot + 1))
+				grep -qxF "$_i" "$TD/ssino" || _miss=$((_miss + 1))
+			done
+			if [ "$_tot" -gt 0 ] && [ "$_miss" -eq 0 ]; then
+				ok "ss sees all $_tot sockets the probe created"
+			else
+				bad "ss sees all $_tot sockets the probe created" \
+				    "$_miss of $_tot were missing from ss's output"
+			fi
+		else
+			skipt 'ss sees the sockets the probe created' 'no ss(8)'
+		fi
+	fi
+	kill "$HOLD" 2>/dev/null
+	wait "$HOLD" 2>/dev/null
+fi
+
+# ===========================================================================
 # the command line fails closed
 # ===========================================================================
 t 'unknown option'            3  -- "$S" -Z
