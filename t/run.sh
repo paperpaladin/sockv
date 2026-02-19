@@ -381,6 +381,97 @@ else
 fi
 
 # ===========================================================================
+# /proc/net/*: the same kernel, through a different formatter
+# ===========================================================================
+# Ranked last among the three oracles, and for a reason worth stating. ss is a
+# different program, written by other people, reading the same netlink
+# interface -- so it catches a misunderstanding on our side of that interface.
+# /proc/net/tcp is the same kernel rendering the same structures through a
+# different printf, so a kernel-side misunderstanding, or a wrong idea about
+# what a field means, would sail through both.
+#
+# It is also provably lossy, which is why sockv does not read it: a TCP socket
+# that is bound and neither listening nor connected lives only in the bind
+# hash, and /proc/net/tcp does not list it at all while sock_diag reports it.
+# That asymmetry is asserted further down rather than assumed, with a socket
+# the suite creates for the purpose.
+#
+# So this is a one-directional check, and it compares inode, uid and port --
+# the three fields /proc encodes differently enough to be worth a second
+# opinion. The port in particular: /proc writes it as big-endian hex text and
+# the address as little-endian hex text, so agreeing with it about a port
+# number is an encoding-independent check on the byte order.
+#
+# proc_inet NAME: every socket /proc lists must be one sockv lists.
+proc_inet() {
+	awk 'function hx(s,  i, c, v, d) {
+		v = 0
+		for (i = 1; i <= length(s); i++) {
+			d = index("0123456789abcdef", tolower(substr(s, i, 1)))
+			if (d == 0) return -1
+			v = v * 16 + d - 1
+		}
+		return v
+	}
+	FNR > 1 { split($2, a, ":"); print $10, $8, hx(a[2]) }' \
+		/proc/net/tcp /proc/net/tcp6 /proc/net/udp /proc/net/udp6 \
+		2>/dev/null | sort
+}
+my_inet_ino() {
+	"$S" -tu | awk '{
+		n = split($4, a, ":")
+		if (a[n] == "*") a[n] = 0
+		print $6, $7, a[n]
+	}' | sort
+}
+proc_unix() {
+	awk 'FNR > 1 { print $7, (NF >= 8 ? $8 : "*") }' /proc/net/unix \
+		2>/dev/null | sort -u
+}
+my_unix_name() {
+	"$S" -x | awk '{ l = $4; sub(/:[0-9]+$/, "", l); print $6, l }' |
+		sort -u
+}
+
+# procsub NAME MINROWS PROCFN MYFN
+procsub() {
+	_n=$1; _min=$2; _pf=$3; _mf=$4
+	_try=0
+	while [ "$_try" -lt 4 ]; do
+		_try=$((_try + 1))
+		"$_pf"                            > "$TD/pbefore"
+		"$_mf"                            > "$TD/pmine"
+		"$_pf"                            > "$TD/pafter"
+		comm -12 "$TD/pbefore" "$TD/pafter" > "$TD/pstable"
+		comm -23 "$TD/pstable" "$TD/pmine"  > "$TD/pmissing"
+		[ ! -s "$TD/pmissing" ] && break
+	done
+	_c=$(wc -l < "$TD/pstable" | tr -d ' ')
+	if [ -s "$TD/pmissing" ]; then
+		bad "$_n" "after $_try attempts, $_c rows stable in /proc" \
+		    "/proc lists these and sockv does not:" \
+		    "$(head -20 "$TD/pmissing" | sed 's/^/  /')"
+	else
+		ok "$_n ($_c rows)"
+	fi
+	if [ "$_c" -ge "$_min" ]; then
+		ok "$_n: compared $_c rows (>= $_min)"
+	else
+		bad "$_n: compared $_c rows (>= $_min)" \
+		    "the check above was vacuous or nearly so"
+	fi
+}
+
+if [ -r /proc/net/tcp ] && [ -r /proc/net/unix ]; then
+	procsub '/proc/net/{tcp,tcp6,udp,udp6} inode+uid+port' 4 \
+	    proc_inet my_inet_ino
+	procsub '/proc/net/unix inode+name' 4 proc_unix my_unix_name
+else
+	skipt '/proc/net inet cross-check' '/proc/net is not readable here'
+	skipt '/proc/net/unix cross-check' '/proc/net is not readable here'
+fi
+
+# ===========================================================================
 # sockets this suite made itself, so it knows the answer before it asks
 # ===========================================================================
 # The third oracle, and the only one that is not a comparison: t/probe binds
@@ -446,6 +537,32 @@ else
 		else
 			bad 'unix name containing spaces appears verbatim' \
 			    "looked for [$_sp]"
+		fi
+
+		# The claim that justifies not reading /proc in the first
+		# place, asserted rather than assumed: the probe's bound-only
+		# TCP socket is in sockv's output and is not in /proc/net/tcp,
+		# because a socket in neither the listening nor the
+		# established hash is in the bind hash only and /proc walks
+		# the first two. Like the ABI-1 truncate test in jail, this is
+		# a passing test whose expectation is that something is
+		# missing.
+		_bo=$(awk '$1 == "EXPECT" && $2 == "tcp4-bound-only" {print $8}' \
+		    "$TD/inv")
+		if [ -z "$_bo" ]; then
+			skipt 'bound-only TCP socket is absent from /proc/net/tcp' \
+			    'the probe could not bind it'
+		elif ! grep -qxF "inet tcp UNCONN 127.0.0.1:$((PORT + 1)) 0.0.0.0:* $_bo $(id -u)" "$TD/live"; then
+			bad 'bound-only TCP socket is absent from /proc/net/tcp' \
+			    "sockv did not report inode $_bo either, so the" \
+			    "asymmetry claim is untested rather than confirmed"
+		elif awk 'FNR > 1 {print $10}' /proc/net/tcp 2>/dev/null |
+		     grep -qxF "$_bo"; then
+			bad 'bound-only TCP socket is absent from /proc/net/tcp' \
+			    "inode $_bo turned up in /proc/net/tcp after all;" \
+			    "the kernel changed and the README is now wrong"
+		else
+			ok 'bound-only TCP socket is absent from /proc/net/tcp'
 		fi
 
 		# The differential's socket counts only prove something if the
