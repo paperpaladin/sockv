@@ -23,9 +23,11 @@ LC_ALL=C
 export LC_ALL
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-# Optional argument: which binary to judge. t/mutants.sh uses it to point the
-# whole suite at a deliberately broken build.
+# Optional arguments: which binaries to judge. t/mutants.sh uses the first to
+# point the whole suite at a deliberately broken build, and `make test-asan`
+# uses both to point it at sanitised ones.
 S=${1:-$ROOT/sockv}
+P=${2:-$ROOT/t/probe}
 
 pass=0; fail=0; skip=0
 
@@ -36,11 +38,22 @@ bad()   {
 	if [ $# -gt 0 ]; then printf '%s\n' "$@" | sed 's/^/      | /'; fi
 }
 
+# Belt and braces with the Makefile's ASAN_OPTIONS=exitcode=86. A sanitizer
+# abort exits 1 by default, and several assertions below legitimately expect
+# exit 1 -- so a heap overread could be scored as a clean error diagnostic.
+# Catching the report text closes that hole even if the options are not set.
+sanitizer_fired() {
+	case $1 in *Sanitizer*) return 0;; esac
+	return 1
+}
+
 # t NAME WANT_STATUS -- CMD...   assert the exit status of CMD
 t() {
 	_n=$1; _w=$2; shift 3
 	_o=$("$@" 2>&1); _s=$?
-	if [ "$_s" -eq "$_w" ]; then ok "$_n"
+	if sanitizer_fired "$_o"; then
+		bad "$_n" "a sanitizer fired" "$_o"
+	elif [ "$_s" -eq "$_w" ]; then ok "$_n"
 	else bad "$_n" "want status $_w, got $_s" "$_o"; fi
 }
 
@@ -248,7 +261,6 @@ fi
 #
 # --parse runs the same walk() over the same handlers as the live path, so a
 # bounds check these fixtures prove is the bounds check the kernel meets.
-P="$ROOT/t/probe"
 TO=
 command -v timeout >/dev/null 2>&1 && TO="timeout 10"
 
@@ -283,7 +295,9 @@ else
 		fi
 		_e=$($TO "$S" --parse "$_p" "$TD/f.bin" 2>&1 >/dev/null)
 		_s=$?
-		if [ "$_s" -eq "$_w" ] && printf '%s' "$_e" | grep -qF "$_m"
+		if sanitizer_fired "$_e"
+		then bad "$_n" "a sanitizer fired" "$_e"
+		elif [ "$_s" -eq "$_w" ] && printf '%s' "$_e" | grep -qF "$_m"
 		then ok "$_n"
 		else bad "$_n" "want exit $_w and stderr naming [$_m]" \
 		         "got exit $_s: $_e"; fi

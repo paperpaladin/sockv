@@ -28,6 +28,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <linux/inet_diag.h>
@@ -682,7 +683,8 @@ static int parse_file(const char *proto, const char *path)
 {
 	struct dump d;
 	unsigned char *buf;
-	size_t cap = 1u << 20, len;
+	struct stat st;
+	size_t len;
 	FILE *f;
 	int r;
 
@@ -703,17 +705,32 @@ static int parse_file(const char *proto, const char *path)
 		fail("%s: %s", path, strerror(errno));
 		return EX_FAIL;
 	}
-	buf = malloc(cap);
+	/*
+	 * The buffer is exactly the size of the file, and that is a property
+	 * of the test rig rather than a micro-optimisation. Reading into a
+	 * generously sized buffer leaves a deleted bounds check reading
+	 * uninitialised bytes that are still inside the allocation, where
+	 * AddressSanitizer cannot see it -- which is how `make test-asan`
+	 * silently stopped being able to detect the one defect class it
+	 * exists for. With the allocation ending where the data ends, the
+	 * first byte past the reply is a heap-buffer-overflow.
+	 */
+	if (fstat(fileno(f), &st) < 0 || st.st_size < 0) {
+		fclose(f);
+		fail("%s: fstat: %s", path, strerror(errno));
+		return EX_FAIL;
+	}
+	len = (size_t)st.st_size;
+	buf = malloc(len ? len : 1);
 	if (!buf) {
 		fclose(f);
 		fail("out of memory");
 		return EX_FAIL;
 	}
-	len = fread(buf, 1, cap, f);
-	if (ferror(f)) {
+	if (len && fread(buf, 1, len, f) != len) {
 		fclose(f);
 		free(buf);
-		fail("%s: read: %s", path, strerror(errno));
+		fail("%s: short read", path);
 		return EX_FAIL;
 	}
 	fclose(f);
