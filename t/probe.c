@@ -234,6 +234,40 @@ static int build(const char *c)
 		done();
 		return 0;
 	}
+	if (!strcmp(c, "v6-scoped")) {
+		/*
+		 * A link-local address with an interface scope. ss renders
+		 * this as [addr]%ifname:port -- brackets around the address,
+		 * then the scope, then the port -- and nothing on a loopback
+		 * -only test machine produces one, so the fixture is the only
+		 * thing that pins the order of those three parts.
+		 */
+		off = inet_rec(AF_INET6, TCP_LISTEN, 546,
+		    0, "fe80::1", "::", 1, 4253, 0, 1);
+		rec_end(off);
+		done();
+		return 0;
+	}
+	if (!strcmp(c, "state-unknown")) {
+		/* A state number no kernel sends today. The row must survive
+		 * with a placeholder rather than being dropped: losing a
+		 * socket is worse than naming its state badly, and the
+		 * differential will report the disagreement either way. */
+		off = inet_rec(AF_INET, 200, 8080, 443, "127.0.0.1",
+		    "10.0.0.1", 0, 4254, 1001, 0);
+		rec_end(off);
+		done();
+		return 0;
+	}
+	if (!strcmp(c, "unix-type-unknown")) {
+		/* AF_UNIX accepts no fourth socket type, so this is the only
+		 * way the u_? placeholder can ever be reached. */
+		off = unix_rec(42, TCP_LISTEN, 4255, 0, 1001,
+		    "/run/odd.sock", sizeof "/run/odd.sock");
+		rec_end(off);
+		done();
+		return 0;
+	}
 	if (!strcmp(c, "unix-path")) {
 		off = unix_rec(SOCK_STREAM, TCP_LISTEN, 4248, 0, 1001,
 		    "/run/probe.sock", sizeof "/run/probe.sock");
