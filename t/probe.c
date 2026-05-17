@@ -55,9 +55,26 @@ static size_t L;
  * needs the unpadded figure to build the case a real kernel cannot. */
 static size_t unpadded;
 
+/* Every write to the fixture buffer goes through here, so one bound covers
+ * them all. A test tool that overflows its own buffer produces a fixture that
+ * is wrong in a way nobody asked for. */
 static void raw(const void *p, size_t n)
 {
+	if (L + n > sizeof B) {
+		fprintf(stderr, "probe: fixture exceeds %zu bytes\n", sizeof B);
+		exit(2);
+	}
 	memcpy(B + L, p, n);
+	L += n;
+}
+
+static void fill(int byte, size_t n)
+{
+	if (L + n > sizeof B) {
+		fprintf(stderr, "probe: fixture exceeds %zu bytes\n", sizeof B);
+		exit(2);
+	}
+	memset(B + L, byte, n);
 	L += n;
 }
 
@@ -65,7 +82,14 @@ static void raw(const void *p, size_t n)
  * alignment relative to the record. */
 static void pad4(void)
 {
-	while (L & 3u) B[L++] = 0;
+	while (L & 3u) {
+		if (L >= sizeof B) {
+			fprintf(stderr, "probe: fixture exceeds %zu bytes\n",
+			    sizeof B);
+			exit(2);
+		}
+		B[L++] = 0;
+	}
 }
 
 static size_t rec_start(uint16_t type, uint16_t flags)
@@ -370,8 +394,7 @@ static int build(const char *c)
 	/* --- malformed: every length in the stream, lying -------------- */
 	if (!strcmp(c, "short-buffer")) {
 		/* Nine bytes: fewer than an nlmsghdr. */
-		memset(B, 0x41, 9);
-		L = 9;
+		fill(0x41, 9);
 		return 0;
 	}
 	if (!strcmp(c, "len-under")) {
@@ -408,16 +431,14 @@ static int build(const char *c)
 		off = inet_rec(AF_INET, TCP_ESTABLISHED, 1, 2, "127.0.0.1",
 		    "127.0.0.2", 0, 1, 1, 0);
 		rec_end(off);
-		memset(B + L, 0x5a, 7);          /* a truncated final header */
-		L += 7;
+		fill(0x5a, 7);                   /* a truncated final header */
 		return 0;
 	}
 	if (!strcmp(c, "payload-short")) {
 		/* Declares itself a socket record and carries eight bytes,
 		 * where inet_diag_msg needs seventy-two. */
 		off = rec_start(SOCK_DIAG_BY_FAMILY, NLM_F_MULTI);
-		memset(B + L, 0, 8);
-		L += 8;
+		fill(0, 8);
 		rec_end(off);
 		return 0;
 	}
@@ -442,8 +463,7 @@ static int build(const char *c)
 	if (!strcmp(c, "attr-truncated")) {
 		off = inet_rec(AF_INET, TCP_ESTABLISHED, 1, 2, "127.0.0.1",
 		    "127.0.0.2", 0, 1, 1, 0);
-		memset(B + L, 0x7f, 3);          /* 3 bytes: no attr header */
-		L += 3;
+		fill(0x7f, 3);                   /* 3 bytes: no attr header */
 		rec_end(off);
 		return 0;
 	}
@@ -480,8 +500,7 @@ static int build(const char *c)
 	}
 	if (!strcmp(c, "unknown-msg-type")) {
 		off = rec_start(1234, NLM_F_MULTI);
-		memset(B + L, 0, 16);
-		L += 16;
+		fill(0, 16);
 		rec_end(off);
 		return 0;
 	}
