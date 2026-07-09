@@ -136,8 +136,18 @@ mutant 'every unix socket reads as unnamed' caught \
 # --- state filters: which sockets come back at all ------------------------
 mutant '-l uses TCP_LISTEN for UDP' caught \
 	's/listening ? SF(TCP_CLOSE)/listening ? SF(TCP_LISTEN)/' ''
-mutant '-l treats u_dgr like u_str' caught \
-	's/m.udiag_type == SOCK_DGRAM ? TCP_CLOSE/m.udiag_type == 99 ? TCP_CLOSE/' ''
+# This replaces '-l treats u_dgr like u_str', which targeted a per-socket-type
+# conditional that no longer exists: -l now accepts TCP_LISTEN or TCP_CLOSE for
+# every UNIX type, because that is ss's own state mask and the type-conditional
+# form was dropping the one unbound stream socket ss reports. Dropping the
+# TCP_CLOSE arm is the equivalent mutation against the new shape -- it loses
+# every u_dgr row and the UNCONN stream ones.
+#
+# The old mutant did not silently pass when its pattern stopped matching; the
+# harness said "the mutation did not apply; sockv.c moved", which is why this
+# needed retargeting rather than deleting.
+mutant '-l drops the TCP_CLOSE half of the unix state mask' caught \
+	's/m.udiag_state != TCP_LISTEN \&\& m.udiag_state != TCP_CLOSE/m.udiag_state != TCP_LISTEN/' ''
 
 # --- the record walker: framing and bounds --------------------------------
 mutant 'only the first record is read' caught \
