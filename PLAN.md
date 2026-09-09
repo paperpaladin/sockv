@@ -7,7 +7,7 @@
 List the kernel's TCP, UDP and UNIX domain sockets by asking the kernel over
 `NETLINK_SOCK_DIAG`, with `inet_diag_req_v2` for TCP and UDP and
 `unix_diag_req` for UNIX, driven with `sendmsg(2)` and `recvmsg(2)` on an
-`AF_NETLINK` socket. Not by reading `/proc/net/*`, which is lossy: a TCP
+`AF_NETLINK` socket. Not by reading `/proc/net/*`, which is lossy. A TCP
 socket that is bound and neither listening nor connected does not appear
 there at all.
 
@@ -19,7 +19,7 @@ FAMILY NETID STATE LOCAL PEER INODE UID
 
 `FAMILY` is `inet`, `inet6` or `unix`. `NETID` is `tcp`, `udp`, `u_str`,
 `u_dgr` or `u_seq`. `STATE`, `LOCAL` and `PEER` are rendered exactly as
-`ss -n` renders them, including `ss`'s two quirks: an all-zero IPv6 address
+`ss -n` renders them, including `ss`'s two quirks. An all-zero IPv6 address
 prints as `*`, not `[::]` when the socket is not `IPV6_V6ONLY`, and a
 nonzero `idiag_if` appends `%ifname` to the local end only. For a UNIX socket
 `LOCAL` is `name:inode` and `PEER` is `*:peer-inode`, matching the two columns
@@ -67,7 +67,7 @@ Three halves, and all three are checked by something outside this program:
    and a diagnostic naming the field, and the same suite passes under
    `-fsanitize=address,undefined`.
 
-If any of those three fails, the program is worthless: a socket enumerator
+If any of those three fails, the program is worthless. A socket enumerator
 that silently drops sockets is worse than no enumerator, and a netlink parser
 that reads out of bounds is a vulnerability in anything that uses it.
 

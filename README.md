@@ -97,7 +97,7 @@ attempt fails: a real defect mismatches on all of them, while churn moves.
 
 2. Sockets the suite creates itself. `t/probe hold` binds and connects
 nineteen sockets whose family, type, state and address it chose, reads each
-one's inode out of `fstat(2)` on its own descriptor: the same number the
+one's inode out of `fstat(2)` on its own descriptor. The same number the
 kernel reports as `idiag_inode`, and prints the exact row sockv must
 produce. The addresses in those expectations are printed from the numbers
 passed to `bind(2)`, never by rendering a `sockaddr` back out, so the probe
@@ -235,7 +235,7 @@ version and the reason. A skip is never dressed up as a pass.
 
 `make mutants` plants 26 defects in `sockv.c` with `sed`, builds each one, runs
 the whole suite against the broken binary, and asserts the verdict. Two
-mutants are expected to *survive*, and asserting that is the point: a
+mutants are expected to *survive*, and asserting that is the point. A
 survivor that starts being caught fails the script too, because at that moment
 this README is the thing that has become wrong.
 
@@ -421,7 +421,7 @@ above.
 ### Inherently racy
 
 - The listing is a snapshot of something moving. Sockets appear and vanish
-  while the dump is being produced. `NLM_F_DUMP_INTR` is handled: the kernel
+  while the dump is being produced. `NLM_F_DUMP_INTR` is handled. The kernel
   sets it when its iterator was disturbed, the dump is restarted up to eight
   times, and after that sockv fails loudly instead of printing a listing the
   kernel has already said is inconsistent, but a socket created after the
@@ -435,7 +435,7 @@ above.
 - The receive buffer is a fixed 256KB static array and a datagram that
   does not fit is reported as a failure, not grown into. `MSG_TRUNC`
   makes `recvmsg` report the real size, so this fails loudly instead of
-  silently dropping sockets, but see the mutation list: it is the one check
+  silently dropping sockets, but see the mutation list. It is the one check
   the suite cannot exercise on this machine, because no dump here comes close.
   Marked `shortcut:` in the source. The upgrade is a realloc loop driven by
   the returned length.
@@ -455,7 +455,7 @@ above.
 ### Environment
 
 - Requires `sock_diag`. `CONFIG_INET_DIAG`, `CONFIG_UNIX_DIAG` and the
-  matching modules. There is no `/proc` fallback, deliberately: a fallback
+  matching modules. There is no `/proc` fallback, deliberately. A fallback
   would mean sometimes returning the lossy answer without the caller knowing
   which. `socket(AF_NETLINK, ..., NETLINK_SOCK_DIAG)` failing is exit 1 with
   the errno, and the suite skips every assertion loudly.
