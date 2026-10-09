@@ -643,6 +643,12 @@ static int dump_inet(struct dump *d, int family, int proto, uint32_t states,
 	 * print. INET_DIAG_SKV6ONLY is not requestable anyway -- idiag_ext is
 	 * eight bits wide and that attribute is number 11 -- the kernel sends
 	 * it unasked for every AF_INET6 socket.
+	 *
+	 * shortcut: no INET_DIAG_REQ_BYTECODE either, so every socket crosses
+	 * the netlink socket even when the caller wanted one port. The ceiling
+	 * is the whole socket table per invocation; the upgrade is to compile
+	 * a bytecode program from an address/port/device filter and attach it
+	 * to this request, which is how ss avoids the same cost.
 	 */
 	d->netid = netid;
 	d->show = show_inet;
