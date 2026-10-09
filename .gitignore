@@ -1,0 +1,15 @@
+# build outputs
+/sockv
+/sockv-san
+t/probe
+
+# test scratch
+t/tmp/
+
+# editor / tooling debris
+*.o
+*.core
+core
+vgcore.*
+.cache/
+compile_commands.json
