@@ -472,7 +472,7 @@ above.
 
 ## Design
 
-One file, `sockv.c`, 860 lines, about a quarter of them comments explaining why
+One file, `sockv.c`, 866 lines, about a quarter of them comments explaining why
 the kernel or `ss` insists on something.
 
 ```
