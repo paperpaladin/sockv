@@ -94,6 +94,12 @@ my5() { "$S" "$@" | awk '{print $2, $3, $4, $5, $6}'     | sort; }
 # bag of key:value tokens. uid and inode come out of that bag by prefix rather
 # than by position, because its contents vary with kernel and cgroup.
 #
+# ss omits the uid: token entirely when the uid is zero, so the default below
+# is load-bearing rather than defensive: on this machine the four rows without
+# one are TIME-WAIT sockets, which carry no owning socket to ask and which
+# sockv therefore reports as uid 0 and inode 0 -- the same answer, by
+# agreement rather than by coincidence.
+#
 # A UNIX row is shaped differently: $5 is the name, $6 the socket's own inode
 # (ss calls it the Port), $7 is always "*" and $8 the peer's inode. sockv
 # joins those into name:inode and *:peer-inode so both kinds of row compare
