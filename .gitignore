@@ -2,6 +2,7 @@
 /sockv
 /sockv-san
 t/probe
+t/probe-san
 
 # test scratch
 t/tmp/
