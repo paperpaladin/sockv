@@ -320,13 +320,6 @@ static int show_inet(const unsigned char *rec, size_t reclen, const char *netid)
 }
 
 /*
- * A UNIX socket's identity is its inode, and ss reports it in the column it
- * calls "Port" -- so the local end reads `name:inode` and the peer end reads
- * `*:peer-inode`, which is the same address:port shape the inet rows use and
- * keeps one comparison for both. The address half of a peer is always "*"
- * because a UNIX socket's peer has no name of its own to report.
- */
-/*
  * -l selects sockets that can still receive something new, and for UNIX that
  * is a per-socket-type question rather than a per-dump one: a stream or
  * seqpacket listener sits in TCP_LISTEN, while a bound datagram socket sits in
@@ -338,6 +331,13 @@ static int show_inet(const unsigned char *rec, size_t reclen, const char *netid)
  */
 static int listen_only;
 
+/*
+ * A UNIX socket's identity is its inode, and ss reports it in the column it
+ * calls "Port" -- so the local end reads `name:inode` and the peer end reads
+ * `*:peer-inode`, which is the same address:port shape the inet rows use and
+ * keeps one comparison for both. The address half of a peer is always "*"
+ * because a UNIX socket's peer has no name of its own to report.
+ */
 static int show_unix(const unsigned char *rec, size_t reclen, const char *unused)
 {
 	const unsigned char *base = rec + NLMSG_HDRLEN;
