@@ -35,6 +35,13 @@ SANFLAGS = -std=c11 -g -O1 -fsanitize=address,undefined \
 SANOPT   = ASAN_OPTIONS=exitcode=86 \
            UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1:exitcode=86
 
+# Can the suite fail? Plants a defect, builds it, runs the whole suite against
+# the broken binary, and asserts the verdict -- including for the mutants that
+# are documented as surviving. Slow (one build and one full suite per mutant),
+# so it is not part of `make test`.
+mutants: all
+	@t/mutants.sh
+
 test-asan: sockv.c t/probe.c
 	$(CC) $(SANFLAGS) -o sockv-san sockv.c $(LDFLAGS)
 	$(CC) $(SANFLAGS) -o t/probe-san t/probe.c $(LDFLAGS)
@@ -44,4 +51,4 @@ clean:
 	rm -f sockv sockv-san t/probe t/probe-san
 	rm -rf t/tmp
 
-.PHONY: all test test-asan clean
+.PHONY: all test test-asan mutants clean
