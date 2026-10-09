@@ -3,8 +3,10 @@
  *
  *   sockv -t      TCP        sockv -l   listening sockets only
  *   sockv -u      UDP        sockv -a   every state (the default)
+ *   sockv -x      UNIX domain
  *
- * Over NETLINK_SOCK_DIAG, with inet_diag_req_v2 for TCP and UDP, talking to
+ * Over NETLINK_SOCK_DIAG, with inet_diag_req_v2 for TCP and UDP and
+ * unix_diag_req for UNIX domain sockets, talking to
  * the kernel with sendmsg(2) and recvmsg(2). Not by parsing /proc/net/tcp:
  * that path is a second rendering of the same data, it is lossy (a bound but
  * unconnected TCP socket does not appear in it at all), it is quadratic in the
@@ -31,6 +33,7 @@
 #include <linux/inet_diag.h>
 #include <linux/netlink.h>
 #include <linux/sock_diag.h>
+#include <linux/unix_diag.h>
 
 /*
  * Exit status is part of the interface, because the test harness asserts on
@@ -263,6 +266,16 @@ static int attr_u8(const struct attrs *at, unsigned t, uint8_t *v)
 	return 0;
 }
 
+static int attr_u32(const struct attrs *at, unsigned t, uint32_t *v)
+{
+	if (!at->val[t]) return 0;
+	if (at->len[t] < 4)
+		return refuse("attribute %u carries %u bytes, needs 4", t,
+		    at->len[t]);
+	memcpy(v, at->val[t], 4);
+	return 0;
+}
+
 /* ------------------------------------------------------------- the messages */
 
 /*
@@ -305,6 +318,97 @@ static int show_inet(const unsigned char *rec, size_t reclen, const char *netid)
 
 	row(fam, netid, state_name(m.idiag_state), local, peer,
 	    m.idiag_inode, m.idiag_uid);
+	return 0;
+}
+
+/*
+ * A UNIX socket's identity is its inode, and ss reports it in the column it
+ * calls "Port" -- so the local end reads `name:inode` and the peer end reads
+ * `*:peer-inode`, which is the same address:port shape the inet rows use and
+ * keeps one comparison for both. The address half of a peer is always "*"
+ * because a UNIX socket's peer has no name of its own to report.
+ */
+/*
+ * -l selects sockets that can still receive something new, and for UNIX that
+ * is a per-socket-type question rather than a per-dump one: a stream or
+ * seqpacket listener sits in TCP_LISTEN, while a bound datagram socket sits in
+ * TCP_CLOSE, exactly as a bound UDP socket does. unix_diag takes one state
+ * mask for the whole dump, so the request asks for both and the display drops
+ * the combinations that are not "listening". ss draws the same line -- a
+ * previous version of this file used TCP_LISTEN alone and the differential
+ * found the 60 u_dgr sockets it was dropping.
+ */
+static int listen_only;
+
+static int show_unix(const unsigned char *rec, size_t reclen, const char *unused)
+{
+	const unsigned char *base = rec + NLMSG_HDRLEN;
+	struct unix_diag_msg m;
+	struct attrs at;
+	size_t payload, off;
+	uint32_t peer = 0, uid = 0;
+	char name[160], local[192], peerbuf[32];
+	const char *netid;
+
+	(void)unused;
+	payload = reclen - NLMSG_HDRLEN;
+	off = NLMSG_ALIGN(sizeof m);
+	if (payload < off)
+		return refuse("SOCK_DIAG_BY_FAMILY message carries %zu payload "
+		    "bytes, unix_diag_msg needs %zu", payload, off);
+	memcpy(&m, base, sizeof m);
+
+	if (m.udiag_family != AF_UNIX)
+		return refuse("udiag_family %u is not AF_UNIX (%d)",
+		    m.udiag_family, AF_UNIX);
+
+	if (parse_attrs(base + off, payload - off, &at) < 0) return -1;
+	if (attr_u32(&at, UNIX_DIAG_PEER, &peer) < 0) return -1;
+	/* Absent UNIX_DIAG_UID leaves 0, which is indistinguishable from a
+	 * root-owned socket. The kernel has sent it since 4.17 and we ask for
+	 * it; a kernel that does not would read as uid 0 throughout. */
+	if (attr_u32(&at, UNIX_DIAG_UID, &uid) < 0) return -1;
+
+	if (listen_only &&
+	    m.udiag_state != (m.udiag_type == SOCK_DGRAM ? TCP_CLOSE
+	                                                 : TCP_LISTEN))
+		return 0;
+
+	switch (m.udiag_type) {
+	case SOCK_STREAM:    netid = "u_str"; break;
+	case SOCK_DGRAM:     netid = "u_dgr"; break;
+	case SOCK_SEQPACKET: netid = "u_seq"; break;
+	/* AF_UNIX accepts no other type, so this is unreachable rather than
+	 * tolerant -- but printing a placeholder keeps the socket in the
+	 * listing and lets the differential report the surprise. */
+	default:             netid = "u_?";   break;
+	}
+
+	name[0] = '\0';
+	if (at.val[UNIX_DIAG_NAME]) {
+		size_t n = at.len[UNIX_DIAG_NAME];
+
+		if (n >= sizeof name)
+			return refuse("UNIX_DIAG_NAME is %zu bytes; sun_path "
+			    "holds at most %zu", n, sizeof name - 1);
+		memcpy(name, at.val[UNIX_DIAG_NAME], n);
+		name[n] = '\0';
+		/*
+		 * A filesystem name arrives with the kernel's trailing NUL
+		 * included in the attribute. An abstract name begins with a
+		 * NUL and has no terminator at all, so the length is the only
+		 * bound there is. ss renders the leading NUL as "@" and stops
+		 * at the next NUL, and we match it -- see the README on what
+		 * that means for a name containing whitespace.
+		 */
+		if (n && name[0] == '\0') name[0] = '@';
+	}
+	if (!name[0]) snprintf(name, sizeof name, "*");
+
+	snprintf(local, sizeof local, "%s:%u", name, m.udiag_ino);
+	snprintf(peerbuf, sizeof peerbuf, "*:%u", peer);
+	row("unix", netid, state_name(m.udiag_state), local, peerbuf,
+	    m.udiag_ino, uid);
 	return 0;
 }
 
@@ -547,6 +651,28 @@ static int dump_inet(struct dump *d, int family, int proto, uint32_t states,
 	return run_dump(d, &req, sizeof req);
 }
 
+static int dump_unix(struct dump *d, uint32_t states)
+{
+	struct {
+		struct nlmsghdr nlh;
+		struct unix_diag_req r;
+	} req;
+
+	memset(&req, 0, sizeof req);
+	req.nlh.nlmsg_len = sizeof req;
+	req.nlh.nlmsg_type = SOCK_DIAG_BY_FAMILY;
+	req.nlh.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+	req.nlh.nlmsg_seq = ++d->seq;
+	req.r.sdiag_family = AF_UNIX;
+	req.r.udiag_states = states;
+	/* Unlike inet_diag, unix_diag sends nothing it was not asked for: the
+	 * name, the peer's inode and the owning uid are all opt-in. */
+	req.r.udiag_show = UDIAG_SHOW_NAME | UDIAG_SHOW_PEER | UDIAG_SHOW_UID;
+	d->netid = NULL;
+	d->show = show_unix;
+	return run_dump(d, &req, sizeof req);
+}
+
 /* --------------------------------------------------------------------- CLI */
 
 /*
@@ -561,12 +687,13 @@ static int dump_inet(struct dump *d, int family, int proto, uint32_t states,
 static void usage(FILE *f)
 {
 	fprintf(f,
-	    "usage: %s [-tu] [-l | -a]\n"
+	    "usage: %s [-tux] [-l | -a]\n"
 	    "\n"
 	    "  -t       TCP sockets          -l   listening only\n"
 	    "  -u       UDP sockets          -a   all states (the default)\n"
+	    "  -x       UNIX domain sockets\n"
 	    "\n"
-	    "With no family flag, both -t and -u are listed.\n"
+	    "With no family flag, all of -t -u -x are listed.\n"
 	    "\n"
 	    "One row per socket, no header:\n"
 	    "  FAMILY NETID STATE LOCAL PEER INODE UID\n"
@@ -577,7 +704,7 @@ static void usage(FILE *f)
 
 int main(int argc, char **argv)
 {
-	int want_t = 0, want_u = 0, listening = 0;
+	int want_t = 0, want_u = 0, want_x = 0, listening = 0;
 	int i, r = 0;
 	struct dump d;
 
@@ -597,6 +724,7 @@ int main(int argc, char **argv)
 				switch (*c) {
 				case 't': want_t = 1; break;
 				case 'u': want_u = 1; break;
+				case 'x': want_x = 1; break;
 				case 'l': listening = 1; break;
 				case 'a': listening = 0; break;
 				default:
@@ -614,7 +742,7 @@ int main(int argc, char **argv)
 		return EX_USAGE;
 	}
 
-	if (!want_t && !want_u) want_t = want_u = 1;
+	if (!want_t && !want_u && !want_x) want_t = want_u = want_x = 1;
 
 	memset(&d, 0, sizeof d);
 	d.fd = nl_open();
@@ -631,6 +759,11 @@ int main(int argc, char **argv)
 
 		if (!r) r = dump_inet(&d, AF_INET, IPPROTO_UDP, st, "udp");
 		if (!r) r = dump_inet(&d, AF_INET6, IPPROTO_UDP, st, "udp");
+	}
+	if (want_x && !r) {
+		listen_only = listening;
+		r = dump_unix(&d, listening ? SF(TCP_LISTEN) | SF(TCP_CLOSE)
+		                            : STATES_ALL);
 	}
 
 	close(d.fd);
