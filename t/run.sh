@@ -316,6 +316,19 @@ else
 	    'inet6 tcp LISTEN *:8080 *:* 4246 0'
 	pok 'v4-mapped address on a v6 socket' tcp v6-mapped \
 	    'inet6 tcp LISTEN [::ffff:127.0.0.1]:8080 *:* 4247 0'
+	# Brackets, then the scope, then the port. Nothing on a loopback-only
+	# machine binds a scoped IPv6 address, so this fixture is the only
+	# thing holding that order in place.
+	pok 'scoped IPv6 address' tcp v6-scoped \
+	    'inet6 tcp LISTEN [fe80::1]%lo:546 [::]:* 4253 0'
+	# Both of these render a value the kernel cannot currently produce.
+	# They must keep the socket in the listing rather than drop it: losing
+	# a socket is worse than naming one of its fields badly, and the
+	# differential reports the disagreement either way.
+	pok 'unknown state keeps the row' tcp state-unknown \
+	    'inet tcp state-200 127.0.0.1:8080 10.0.0.1:443 4254 1001'
+	pok 'unknown unix socket type keeps the row' unix unix-type-unknown \
+	    'unix u_? LISTEN /run/odd.sock:4255 *:0 4255 1001'
 	pok 'udp netid comes from the request' udp v4 \
 	    'inet udp ESTAB 127.0.0.1:8080 10.0.0.1:443 4242 1001'
 	pok 'unix filesystem path' unix unix-path \
