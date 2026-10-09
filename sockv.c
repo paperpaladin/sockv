@@ -122,15 +122,12 @@ static const char *state_name(unsigned s)
 	return buf;
 }
 
-static unsigned long nrow;
-
 static void row(const char *fam, const char *netid, const char *state,
                 const char *local, const char *peer,
                 uint32_t inode, uint32_t uid)
 {
 	printf("%-5s %-5s %-10s %-28s %-28s %8u %6u\n",
 	    fam, netid, state, local, peer, inode, uid);
-	nrow++;
 }
 
 /*
