@@ -5,6 +5,15 @@
  *                          case per shape sockv must render, and one per way
  *                          the record stream can lie about its own lengths.
  *
+ *   probe hold PORT DIR SECS   create sockets whose properties this program
+ *                          chose, print the exact row each one must produce,
+ *                          and stay alive for SECS so the row can be looked
+ *                          for. The inode comes from fstat(2) on the socket's
+ *                          own descriptor, which is the same number the
+ *                          kernel reports as idiag_inode -- so this is an
+ *                          oracle that knows the answer before sockv runs,
+ *                          independent of ss and of /proc.
+ *
  * Nothing here links against sockv or shares a line of code with it. The
  * well-formed cases are hand-built records with values chosen by this file,
  * so the harness can assert on an exact row rather than on whatever the
@@ -22,11 +31,17 @@
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <errno.h>
+#include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
+#include <unistd.h>
 
 #include <linux/inet_diag.h>
 #include <linux/netlink.h>
@@ -468,13 +483,401 @@ static int build(const char *c)
 	return 2;
 }
 
+/* ------------------------------------------------------------------- hold */
+
+/*
+ * The second oracle: sockets this program made, so it knows every field of
+ * the row they must produce before sockv is asked. Addresses are printed from
+ * the numbers passed to bind(2) rather than by rendering a sockaddr back out,
+ * so nothing here can share a formatting misunderstanding with sockv.
+ *
+ * Everything binds to 127.0.0.1, ::1 or the filesystem. Nothing is sent, and
+ * nothing is connected anywhere off this machine.
+ */
+static unsigned long myuid;
+
+static void expect(const char *tag, const char *fam, const char *netid,
+                   const char *state, const char *local, const char *peer,
+                   unsigned long ino)
+{
+	printf("EXPECT %s %s %s %s %s %s %lu %lu\n", tag, fam, netid, state,
+	    local, peer, ino, myuid);
+}
+
+static void skip(const char *tag, const char *why)
+{
+	printf("SKIP %s %s: %s\n", tag, why, strerror(errno));
+}
+
+static unsigned long ino_of(int fd)
+{
+	struct stat st;
+
+	if (fstat(fd, &st) < 0) return 0;
+	return (unsigned long)st.st_ino;
+}
+
+static int v4addr(struct sockaddr_in *a, int port)
+{
+	memset(a, 0, sizeof *a);
+	a->sin_family = AF_INET;
+	a->sin_port = htons((uint16_t)port);
+	a->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	return (int)sizeof *a;
+}
+
+static int v6addr(struct sockaddr_in6 *a, int port)
+{
+	memset(a, 0, sizeof *a);
+	a->sin6_family = AF_INET6;
+	a->sin6_port = htons((uint16_t)port);
+	a->sin6_addr = in6addr_loopback;
+	return (int)sizeof *a;
+}
+
+/* Returns the bound socket, or -1 having already printed a SKIP. */
+static int bind_v4(const char *tag, int type, int port, int backlog)
+{
+	struct sockaddr_in a;
+	int fd, one = 1, n = v4addr(&a, port);
+
+	fd = socket(AF_INET, type, 0);
+	if (fd < 0) { skip(tag, "socket"); return -1; }
+	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+	if (bind(fd, (struct sockaddr *)&a, (socklen_t)n) < 0) {
+		skip(tag, "bind");
+		close(fd);
+		return -1;
+	}
+	if (backlog && listen(fd, backlog) < 0) {
+		skip(tag, "listen");
+		close(fd);
+		return -1;
+	}
+	return fd;
+}
+
+static int bind_v6(const char *tag, int type, int port, int backlog)
+{
+	struct sockaddr_in6 a;
+	int fd, one = 1, n = v6addr(&a, port);
+
+	fd = socket(AF_INET6, type, 0);
+	if (fd < 0) { skip(tag, "socket"); return -1; }
+	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+	if (bind(fd, (struct sockaddr *)&a, (socklen_t)n) < 0) {
+		skip(tag, "bind");
+		close(fd);
+		return -1;
+	}
+	if (backlog && listen(fd, backlog) < 0) {
+		skip(tag, "listen");
+		close(fd);
+		return -1;
+	}
+	return fd;
+}
+
+static int local_port(int fd)
+{
+	struct sockaddr_storage ss;
+	socklen_t n = sizeof ss;
+
+	if (getsockname(fd, (struct sockaddr *)&ss, &n) < 0) return -1;
+	if (ss.ss_family == AF_INET)
+		return ntohs(((struct sockaddr_in *)&ss)->sin_port);
+	return ntohs(((struct sockaddr_in6 *)&ss)->sin6_port);
+}
+
+/* Bind a UNIX socket to a filesystem path or, when path starts with '@', to
+ * that abstract name. Returns -1 having printed a SKIP. */
+static int bind_unix(const char *tag, int type, const char *path, int backlog)
+{
+	struct sockaddr_un un;
+	size_t n = strlen(path);
+	socklen_t len;
+	int fd;
+
+	if (n + 1 > sizeof un.sun_path) { errno = ENAMETOOLONG;
+		skip(tag, "name"); return -1; }
+	memset(&un, 0, sizeof un);
+	un.sun_family = AF_UNIX;
+	if (path[0] == '@') {
+		/* Abstract: a leading NUL, then the name, and the address
+		 * length is the only thing that says where it ends. */
+		memcpy(un.sun_path + 1, path + 1, n - 1);
+		len = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + n);
+	} else {
+		memcpy(un.sun_path, path, n);
+		len = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + n + 1);
+		unlink(path);
+	}
+	fd = socket(AF_UNIX, type, 0);
+	if (fd < 0) { skip(tag, "socket"); return -1; }
+	if (bind(fd, (struct sockaddr *)&un, len) < 0) {
+		skip(tag, "bind");
+		close(fd);
+		return -1;
+	}
+	if (backlog && listen(fd, backlog) < 0) {
+		skip(tag, "listen");
+		close(fd);
+		return -1;
+	}
+	return fd;
+}
+
+static int connect_unix(const char *tag, int type, const char *path)
+{
+	struct sockaddr_un un;
+	size_t n = strlen(path);
+	socklen_t len;
+	int fd;
+
+	memset(&un, 0, sizeof un);
+	un.sun_family = AF_UNIX;
+	if (path[0] == '@') {
+		memcpy(un.sun_path + 1, path + 1, n - 1);
+		len = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + n);
+	} else {
+		memcpy(un.sun_path, path, n);
+		len = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + n + 1);
+	}
+	fd = socket(AF_UNIX, type, 0);
+	if (fd < 0) { skip(tag, "socket"); return -1; }
+	if (connect(fd, (struct sockaddr *)&un, len) < 0) {
+		skip(tag, "connect");
+		close(fd);
+		return -1;
+	}
+	return fd;
+}
+
+static int hold(int base, const char *dir, int secs)
+{
+	char loc[320], peer[320], path[192], path2[192];
+	char abs1[64], abs2[64], spaced[64];
+	struct sockaddr_in a4;
+	struct sockaddr_in6 a6;
+	int l4, l6, b4, u4, u6, p1, p2, c4, s4, c6, s6;
+	int ul, ua, uc, us, ud, uq, sp[2];
+
+	myuid = (unsigned long)getuid();
+
+	/* --- TCP, IPv4: a listener, a connected pair, and a socket that is
+	 *     bound and nothing else. That last one is the shape /proc/net/tcp
+	 *     cannot see at all. */
+	l4 = bind_v4("tcp4-listen", SOCK_STREAM, base, 8);
+	if (l4 >= 0) {
+		snprintf(loc, sizeof loc, "127.0.0.1:%d", base);
+		expect("tcp4-listen", "inet", "tcp", "LISTEN", loc,
+		    "0.0.0.0:*", ino_of(l4));
+
+		v4addr(&a4, base);
+		c4 = socket(AF_INET, SOCK_STREAM, 0);
+		if (c4 >= 0 &&
+		    connect(c4, (struct sockaddr *)&a4, sizeof a4) == 0 &&
+		    (s4 = accept(l4, NULL, NULL)) >= 0) {
+			int cp = local_port(c4);
+
+			snprintf(loc, sizeof loc, "127.0.0.1:%d", cp);
+			snprintf(peer, sizeof peer, "127.0.0.1:%d", base);
+			expect("tcp4-client", "inet", "tcp", "ESTAB", loc,
+			    peer, ino_of(c4));
+			expect("tcp4-server", "inet", "tcp", "ESTAB", peer,
+			    loc, ino_of(s4));
+		} else {
+			skip("tcp4-client", "connect/accept");
+			skip("tcp4-server", "connect/accept");
+		}
+	} else {
+		skip("tcp4-client", "no listener");
+		skip("tcp4-server", "no listener");
+	}
+
+	b4 = bind_v4("tcp4-bound-only", SOCK_STREAM, base + 1, 0);
+	if (b4 >= 0) {
+		snprintf(loc, sizeof loc, "127.0.0.1:%d", base + 1);
+		expect("tcp4-bound-only", "inet", "tcp", "UNCONN", loc,
+		    "0.0.0.0:*", ino_of(b4));
+	}
+
+	/* --- TCP, IPv6. A bind to ::1 makes the kernel set sk_ipv6only, which
+	 *     is why the listener's empty peer end reads [::] and not *. */
+	l6 = bind_v6("tcp6-listen", SOCK_STREAM, base, 8);
+	if (l6 >= 0) {
+		snprintf(loc, sizeof loc, "[::1]:%d", base);
+		expect("tcp6-listen", "inet6", "tcp", "LISTEN", loc,
+		    "[::]:*", ino_of(l6));
+
+		v6addr(&a6, base);
+		c6 = socket(AF_INET6, SOCK_STREAM, 0);
+		if (c6 >= 0 &&
+		    connect(c6, (struct sockaddr *)&a6, sizeof a6) == 0 &&
+		    (s6 = accept(l6, NULL, NULL)) >= 0) {
+			int cp = local_port(c6);
+
+			snprintf(loc, sizeof loc, "[::1]:%d", cp);
+			snprintf(peer, sizeof peer, "[::1]:%d", base);
+			expect("tcp6-client", "inet6", "tcp", "ESTAB", loc,
+			    peer, ino_of(c6));
+			expect("tcp6-server", "inet6", "tcp", "ESTAB", peer,
+			    loc, ino_of(s6));
+		} else {
+			skip("tcp6-client", "connect/accept");
+			skip("tcp6-server", "connect/accept");
+		}
+	} else {
+		skip("tcp6-client", "no listener");
+		skip("tcp6-server", "no listener");
+	}
+
+	/* --- UDP: bound is UNCONN, connected is ESTAB, same as the kernel's
+	 *     TCP state numbers because UDP has no state machine of its own. */
+	u4 = bind_v4("udp4-bound", SOCK_DGRAM, base + 2, 0);
+	if (u4 >= 0) {
+		snprintf(loc, sizeof loc, "127.0.0.1:%d", base + 2);
+		expect("udp4-bound", "inet", "udp", "UNCONN", loc,
+		    "0.0.0.0:*", ino_of(u4));
+	}
+	u6 = bind_v6("udp6-bound", SOCK_DGRAM, base + 2, 0);
+	if (u6 >= 0) {
+		snprintf(loc, sizeof loc, "[::1]:%d", base + 2);
+		expect("udp6-bound", "inet6", "udp", "UNCONN", loc,
+		    "[::]:*", ino_of(u6));
+	}
+
+	p1 = bind_v4("udp4-connected", SOCK_DGRAM, base + 3, 0);
+	p2 = bind_v4("udp4-connected", SOCK_DGRAM, base + 4, 0);
+	if (p1 >= 0 && p2 >= 0) {
+		v4addr(&a4, base + 4);
+		if (connect(p1, (struct sockaddr *)&a4, sizeof a4) == 0) {
+			v4addr(&a4, base + 3);
+			if (connect(p2, (struct sockaddr *)&a4,
+			    sizeof a4) == 0) {
+				snprintf(loc, sizeof loc, "127.0.0.1:%d",
+				    base + 3);
+				snprintf(peer, sizeof peer, "127.0.0.1:%d",
+				    base + 4);
+				expect("udp4-connected", "inet", "udp", "ESTAB",
+				    loc, peer, ino_of(p1));
+				expect("udp4-connected-peer", "inet", "udp",
+				    "ESTAB", peer, loc, ino_of(p2));
+			} else {
+				skip("udp4-connected", "connect");
+			}
+		} else {
+			skip("udp4-connected", "connect");
+		}
+	}
+
+	/* --- UNIX. sockv's local column is name:inode, because ss reports a
+	 *     UNIX socket's inode in the column it labels Port. */
+	snprintf(path, sizeof path, "%s/stream.sock", dir);
+	snprintf(path2, sizeof path2, "%s/dgram.sock", dir);
+	snprintf(abs1, sizeof abs1, "@sockv-probe-%d", base);
+	snprintf(abs2, sizeof abs2, "@sockv-probe-seq-%d", base);
+	snprintf(spaced, sizeof spaced, "@sockv probe %d spaced", base);
+
+	ul = bind_unix("unix-path-listen", SOCK_STREAM, path, 8);
+	if (ul >= 0) {
+		unsigned long li = ino_of(ul);
+
+		snprintf(loc, sizeof loc, "%s:%lu", path, li);
+		expect("unix-path-listen", "unix", "u_str", "LISTEN", loc,
+		    "*:0", li);
+
+		uc = connect_unix("unix-pair", SOCK_STREAM, path);
+		if (uc >= 0 && (us = accept(ul, NULL, NULL)) >= 0) {
+			unsigned long ci = ino_of(uc), si = ino_of(us);
+
+			/* An accepted socket inherits the listener's name; the
+			 * connecting side never had one. */
+			snprintf(loc, sizeof loc, "%s:%lu", path, si);
+			snprintf(peer, sizeof peer, "*:%lu", ci);
+			expect("unix-pair-server", "unix", "u_str", "ESTAB",
+			    loc, peer, si);
+			snprintf(loc, sizeof loc, "*:%lu", ci);
+			snprintf(peer, sizeof peer, "*:%lu", si);
+			expect("unix-pair-client", "unix", "u_str", "ESTAB",
+			    loc, peer, ci);
+		} else {
+			skip("unix-pair-server", "connect/accept");
+			skip("unix-pair-client", "connect/accept");
+		}
+	}
+
+	ua = bind_unix("unix-abstract-listen", SOCK_STREAM, abs1, 8);
+	if (ua >= 0) {
+		unsigned long i = ino_of(ua);
+
+		snprintf(loc, sizeof loc, "%s:%lu", abs1, i);
+		expect("unix-abstract-listen", "unix", "u_str", "LISTEN", loc,
+		    "*:0", i);
+	}
+
+	ud = bind_unix("unix-dgram", SOCK_DGRAM, path2, 0);
+	if (ud >= 0) {
+		unsigned long i = ino_of(ud);
+
+		snprintf(loc, sizeof loc, "%s:%lu", path2, i);
+		expect("unix-dgram", "unix", "u_dgr", "UNCONN", loc, "*:0", i);
+	}
+
+	uq = bind_unix("unix-seqpacket", SOCK_SEQPACKET, abs2, 8);
+	if (uq >= 0) {
+		unsigned long i = ino_of(uq);
+
+		snprintf(loc, sizeof loc, "%s:%lu", abs2, i);
+		expect("unix-seqpacket", "unix", "u_seq", "LISTEN", loc,
+		    "*:0", i);
+	}
+
+	if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) == 0) {
+		unsigned long i0 = ino_of(sp[0]), i1 = ino_of(sp[1]);
+
+		snprintf(loc, sizeof loc, "*:%lu", i0);
+		snprintf(peer, sizeof peer, "*:%lu", i1);
+		expect("unix-socketpair-a", "unix", "u_str", "ESTAB", loc,
+		    peer, i0);
+		expect("unix-socketpair-b", "unix", "u_str", "ESTAB", peer,
+		    loc, i1);
+	} else {
+		skip("unix-socketpair-a", "socketpair");
+		skip("unix-socketpair-b", "socketpair");
+	}
+
+	/*
+	 * An abstract name with spaces in it. A row carrying one cannot be
+	 * matched field by field -- in sockv's output or in ss's -- so the
+	 * harness looks for the name as a substring instead, and the README
+	 * says what that means for anyone parsing either program's output.
+	 */
+	{
+		int fd = bind_unix("unix-spaced", SOCK_STREAM, spaced, 8);
+
+		if (fd >= 0)
+			printf("SPACED %s:%lu\n", spaced, ino_of(fd));
+	}
+
+	printf("READY\n");
+	fflush(stdout);
+	sleep((unsigned)secs);
+	if (ul >= 0) unlink(path);
+	if (ud >= 0) unlink(path2);
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	FILE *f;
 	int r;
 
+	if (argc == 5 && !strcmp(argv[1], "hold"))
+		return hold(atoi(argv[2]), argv[3], atoi(argv[4]));
 	if (argc != 4 || strcmp(argv[1], "emit")) {
-		fprintf(stderr, "usage: %s emit CASE FILE\n", argv[0]);
+		fprintf(stderr, "usage: %s emit CASE FILE\n"
+		    "       %s hold PORT DIR SECONDS\n", argv[0], argv[0]);
 		return 2;
 	}
 	r = build(argv[2]);
