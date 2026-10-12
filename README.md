@@ -219,7 +219,7 @@ ok    stray argument
 ok    --help exits 0
 ok    listing exits 0
 
-82 passed, 0 failed, 1 skipped
+83 passed, 0 failed, 1 skipped
 ```
 
 Exit status is part of the interface, because the suite asserts on it: `0`
@@ -240,7 +240,7 @@ survivor that starts being caught fails the script too, because at that moment
 this README is the thing that has become wrong.
 
 ```
-ok     (no defect planted)                    82 passed, 0 failed, 1 skipped
+ok     (no defect planted)                    83 passed, 0 failed, 1 skipped
 
 ok     port printed without ntohs             caught by 27 assertion(s)
 ok     AF_INET address read as 16 bytes       caught by 17 assertion(s)

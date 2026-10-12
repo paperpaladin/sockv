@@ -320,14 +320,25 @@ static int show_inet(const unsigned char *rec, size_t reclen, const char *netid)
 }
 
 /*
- * -l selects sockets that can still receive something new, and for UNIX that
- * is a per-socket-type question rather than a per-dump one: a stream or
- * seqpacket listener sits in TCP_LISTEN, while a bound datagram socket sits in
- * TCP_CLOSE, exactly as a bound UDP socket does. unix_diag takes one state
- * mask for the whole dump, so the request asks for both and the display drops
- * the combinations that are not "listening". ss draws the same line -- a
- * previous version of this file used TCP_LISTEN alone and the differential
- * found the 60 u_dgr sockets it was dropping.
+ * -l selects sockets in TCP_LISTEN or TCP_CLOSE, for every UNIX socket type.
+ * That is what ss does: its -l filter is a state mask of LISTEN|CLOSE, and
+ * unix_diag reports TCP_CLOSE for anything unconnected, which ss prints as
+ * UNCONN.
+ *
+ * This was conditioned on the socket type -- TCP_LISTEN for stream and
+ * seqpacket, TCP_CLOSE for datagram -- on the reasoning that -l means "can
+ * still receive something new", which an unbound stream socket cannot. The
+ * reasoning is defensible and ss does not share it, and ss is the oracle
+ * here. A stream socket that is neither bound nor connected sits in
+ * TCP_CLOSE, `ss -xl` lists it, and sockv dropped it: `ss` reported
+ * `u_str UNCONN *:16080849` and sockv reported 172 rows against ss's 173.
+ * Any process holding an unbound AF_UNIX stream socket reproduced it, which
+ * is why the suite was failing on this machine rather than intermittently.
+ *
+ * The comment this replaces already recorded the same mistake in the other
+ * direction: an earlier version used TCP_LISTEN alone and the differential
+ * found the 60 u_dgr sockets it was dropping. The fix then was to special-case
+ * datagram rather than to take ss's state mask, which left stream wrong.
  */
 static int listen_only;
 
@@ -368,8 +379,7 @@ static int show_unix(const unsigned char *rec, size_t reclen, const char *unused
 	if (attr_u32(&at, UNIX_DIAG_UID, &uid) < 0) return -1;
 
 	if (listen_only &&
-	    m.udiag_state != (m.udiag_type == SOCK_DGRAM ? TCP_CLOSE
-	                                                 : TCP_LISTEN))
+	    m.udiag_state != TCP_LISTEN && m.udiag_state != TCP_CLOSE)
 		return 0;
 
 	switch (m.udiag_type) {

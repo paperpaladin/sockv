@@ -62,11 +62,32 @@ t() {
 TD=$(mktemp -d) || exit 2
 trap 'rm -rf "$TD"' EXIT INT TERM
 
-# --- is sock_diag reachable at all? skip loudly, never silently pass --------
+# --- is sock_diag reachable at all? ----------------------------------------
+# Two things were wrong with this gate.
+#
+# It asked the binary under test. `"$S" -tl` failing was taken to mean the
+# kernel has no sock_diag -- so any defect in sockv's own netlink transport
+# turned the whole suite into a skip. Changing NETLINK_SOCK_DIAG to 99 in
+# sockv.c produced "0 passed, 0 failed, 7 skipped" and exit 0. ss uses the
+# same interface, so it can adjudicate: if ss can dump and sockv cannot, the
+# fault is sockv's and that is a failure, not an environment.
+#
+# And it exited 0 having asserted nothing. A suite that compared nothing is
+# not a passing suite, whatever the reason -- the same rule applied to wasmi's
+# empty fixture directory and psh's all-skipped corpus. A genuinely restricted
+# environment now exits 1 and says how to acknowledge that deliberately.
 if ! "$S" -tl >/dev/null 2>"$TD/why"; then
+	if command -v ss >/dev/null 2>&1 && ss -tln >/dev/null 2>&1; then
+		bad "sock_diag is reachable but sockv cannot use it" \
+		    "ss -tln works on this kernel, so this is sockv's bug" \
+		    "$(sed 's/^/  /' "$TD/why")"
+		printf '\n%d passed, %d failed, %d skipped\n' "$pass" "$fail" "$skip"
+		exit 1
+	fi
 	echo "sockv cannot reach NETLINK_SOCK_DIAG on this kernel"
 	echo "($(uname -r)):"
 	sed 's/^/  /' "$TD/why"
+	echo "ss cannot either, so this is the environment and not sockv."
 	echo "Likely CONFIG_INET_DIAG=n, or a seccomp or netlink restriction in"
 	echo "whatever this is running inside. Every assertion below needs the"
 	echo "kernel to be the oracle, so they are SKIPPED, not passed."
@@ -75,7 +96,10 @@ if ! "$S" -tl >/dev/null 2>"$TD/why"; then
 		skipt "$n" "no sock_diag"
 	done
 	printf '\n%d passed, %d failed, %d skipped\n' "$pass" "$fail" "$skip"
-	exit 0
+	echo "Nothing was compared, so this is not a pass. Set"
+	echo "SOCKV_ALLOW_NO_SOCK_DIAG=1 to make that exit 0 on purpose."
+	[ "${SOCKV_ALLOW_NO_SOCK_DIAG:-0}" = 1 ] && exit 0
+	exit 1
 fi
 
 HAVE_SS=yes
@@ -457,9 +481,24 @@ my_inet_ino() {
 		print $6, $7, a[n]
 	}' | sort
 }
+# /proc/net/unix prints inode 0 for a socket with no struct socket behind it,
+# and sock_diag does not enumerate those at all -- so the (inode, name) pair
+# `0 /var/run/abrt/abrt.socket` could never match anything sockv produces, and
+# this comparison failed on any machine with a service holding connections in
+# its accept backlog. On this one that is 12 of 1261 rows: 11 in St=02
+# (connecting, abrt's backlog) and 1 in St=04 (disconnecting). Both are states
+# where /proc has a struct sock to list and no inode to name it by.
+#
+# They are excluded, and the count is printed rather than quietly dropped, so
+# a carve-out that grew would be visible. Everything with a real inode is
+# still compared in both directions.
 proc_unix() {
-	awk 'FNR > 1 { print $7, (NF >= 8 ? $8 : "*") }' /proc/net/unix \
-		2>/dev/null | sort -u
+	awk 'FNR > 1 && $7 != 0 { print $7, (NF >= 8 ? $8 : "*") }' \
+		/proc/net/unix 2>/dev/null | sort -u
+}
+
+proc_unix_noinode() {
+	awk 'FNR > 1 && $7 == 0' /proc/net/unix 2>/dev/null | wc -l
 }
 my_unix_name() {
 	"$S" -x | awk '{ l = $4; sub(/:[0-9]+$/, "", l); print $6, l }' |
@@ -499,6 +538,13 @@ if [ -r /proc/net/tcp ] && [ -r /proc/net/unix ]; then
 	procsub '/proc/net/{tcp,tcp6,udp,udp6} inode+uid+port' 4 \
 	    proc_inet my_inet_ino
 	procsub '/proc/net/unix inode+name' 4 proc_unix my_unix_name
+	# Say how many rows the comparison above could not use, so the
+	# exclusion is a reported number rather than an invisible filter.
+	_ni=$(proc_unix_noinode)
+	printf 'note: %s /proc/net/unix row(s) carry inode 0 and are excluded;\n' "$_ni"
+	printf '      sock_diag does not enumerate a socket with no struct socket\n'
+	t '/proc/net/unix: the inode-0 exclusion stays small' 0 -- \
+		sh -c "[ $_ni -lt 100 ]"
 else
 	skipt '/proc/net inet cross-check' '/proc/net is not readable here'
 	skipt '/proc/net/unix cross-check' '/proc/net is not readable here'
