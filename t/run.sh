@@ -304,9 +304,15 @@ else
 			bad "$_n" "probe emit $_c failed" "$(cat "$TD/e")"
 			return
 		fi
-		_got=$($TO "$S" --parse "$_p" "$TD/f.bin" 2>"$TD/e" |
-		       awk 'NF {print $1, $2, $3, $4, $5, $6, $7}')
+		# The status has to come from sockv, not from the pipeline.
+		# `_s=$?` after a pipe reads awk's status, which is always 0 --
+		# so the "exit 0" half of this assertion was dead for all 17
+		# pok cases. A binary whose *successful* --parse returned 2
+		# passed every one of them; only the separate
+		# `t '--parse of an empty file' 0` noticed.
+		$TO "$S" --parse "$_p" "$TD/f.bin" >"$TD/p.out" 2>"$TD/e"
 		_s=$?
+		_got=$(awk 'NF {print $1, $2, $3, $4, $5, $6, $7}' "$TD/p.out")
 		_want=$(printf '%s\n' "$@")
 		if [ "$_s" -eq 0 ] && [ "$_got" = "$_want" ]; then ok "$_n"
 		else bad "$_n" "want exit 0 and" "$_want" \
