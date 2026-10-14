@@ -91,7 +91,7 @@ The live-system race is handled by sandwiching, not by hoping. `ss`
 runs, then sockv, then `ss` again. A socket present in both `ss` runs existed
 for the whole window and must be in sockv's output; a socket in sockv's output
 must be in at least one `ss` run. Sockets that come and go while the three
-programs take turns fall outside both claims, which is what they are. The
+programs take turns fall outside both claims, and that is what they are. The
 sandwich retries up to four times, so only a mismatch that survives every
 attempt fails: a real defect mismatches on all of them, while churn moves.
 
@@ -287,7 +287,7 @@ dropped record fails twenty-five.
   only declines to look for a *further* record in fewer than four remaining
   bytes, and an `nlmsghdr` is sixteen. The identical change to the *attribute*
   walker is a real defect and is caught, because an attribute can be exactly
-  four bytes long, which is why the two call sites are separate mutants.
+  four bytes long, so the two call sites are separate mutants.
   An earlier version of this file changed both at once and called the result
   equivalent. It was wrong, and `make mutants` is what said so.
 - `MSG_TRUNC check deleted` cannot be reached on this machine. The receive
@@ -346,7 +346,7 @@ above.
 ### Fields not implemented
 
 - No process names or PIDs. `ss -p` works by scanning every `/proc/*/fd`
-  for a socket inode, which is not a netlink feature at all, and which an
+  for a socket inode, no netlink feature at all, and something an
   unprivileged process cannot do for sockets owned by other users. sockv does
   not attempt it. The uid column is what it offers instead. This is a
   deliberate non-goal, not a privilege skip, because the information is
@@ -442,8 +442,8 @@ above.
 - AddressSanitizer cannot see an overread on the live path. That static
   buffer is always larger than the data in it, so a read past the end of a
   reply stays inside the object. Only the `--parse` path has an allocation
-  that ends where the data ends, which is why every hostile fixture goes
-  through `--parse`.
+  that ends where the data ends. Every hostile fixture goes through
+  `--parse` for that reason.
 - `SO_RCVBUF` is set best-effort and not checked. On a machine with enough
   sockets the kernel can still run out of space mid-dump; `recvmsg` returns
   `ENOBUFS` and sockv exits 1 naming it.
@@ -501,7 +501,7 @@ meets.
 Output is `ss`'s, down to its quirks. State names are `ss`'s,
 not the kernel's enum names: `TCP_CLOSE` prints as `UNCONN`, and addresses are
 formatted the way `ss` formats them. The alternative is a translation table in
-the test harness, which is a place for a disagreement to hide.
+the test harness, a place for a disagreement to hide.
 
 An unknown attribute type is ignored. An unknown length is refused. The
 kernel grows the attribute enum every few releases and sends some of it unasked:
