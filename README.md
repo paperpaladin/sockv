@@ -99,7 +99,7 @@ attempt fails: a real defect mismatches on all of them, while churn moves.
 nineteen sockets whose family, type, state and address it chose, reads each
 one's inode out of `fstat(2)` on its own descriptor. The same number the
 kernel reports as `idiag_inode`, and prints the exact row sockv must
-produce. The addresses in those expectations are printed from the numbers
+produce. Addresses in those expectations are printed from the numbers
 passed to `bind(2)`, never by rendering a `sockaddr` back out, so the probe
 cannot share a formatting mistake with sockv. This is what makes a failure
 specific: the differential can only say "these sets differ", and these
@@ -285,8 +285,7 @@ dropped record fails twenty-five.
 - `record end-of-buffer loosened by 4` is provably equivalent, not a gap.
   The test fires after the record has already been processed, so the mutant
   only declines to look for a *further* record in fewer than four remaining
-  bytes, and an `nlmsghdr` is sixteen. The identical change to the *attribute*
-  walker is a real defect and is caught, because an attribute can be exactly
+  bytes, and an `nlmsghdr` is sixteen. An identical change to the *attribute* walker is a real defect and is caught, because an attribute can be exactly
   four bytes long, so the two call sites are separate mutants.
   An earlier version of this file changed both at once and called the result
   equivalent. It was wrong, and `make mutants` is what said so.
@@ -425,8 +424,7 @@ above.
   sets it when its iterator was disturbed, the dump is restarted up to eight
   times, and after that sockv fails loudly instead of printing a listing the
   kernel has already said is inconsistent, but a socket created after the
-  dump began is simply not in it, and that is not fixable. The test suite
-  deals with the same race by sandwiching and could not exist otherwise.
+  dump began is simply not in it, and that is not fixable. Its test suite deals with the same race by sandwiching and could not exist otherwise.
 - A long dump can be interrupted forever on a machine churning sockets
   faster than the kernel can walk them. Eight attempts and then exit 1.
 
