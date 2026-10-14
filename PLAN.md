@@ -184,7 +184,7 @@ tree first.
 - [x] `-x` and `unix_diag`.
       why: a different request struct and a different reply struct, not a
       family parameter to the same one. The differential caught `-l` dropping
-      every `u_dgr` socket on its first run, which is the whole argument for
+      every `u_dgr` socket on its first run, the whole argument for
       writing the harness before the feature it judges.
 - [x] `--parse` and `t/probe emit`: the record walker driven with bytes no
       kernel would send.
@@ -239,7 +239,7 @@ tree first.
 - [ ] `idiag_ext` and the queue, timer and retransmit columns, so `ss -o` and
       the Recv-Q/Send-Q pair become comparable.
       why: two columns of `ss`'s default output are currently not compared by
-      the differential at all, which is a hole in an oracle that otherwise
+      the differential at all, a hole in an oracle that otherwise
       compares every field. Queue lengths are already in `inet_diag_msg` and
       cost nothing to print.
 - [ ] `netlink_diag`, so `sockv -N` lists netlink sockets.
@@ -257,7 +257,7 @@ tree first.
 - [ ] `SOCK_DIAG_BY_FAMILY` with `NLM_F_REQUEST` only, to look up one socket
       by inode instead of dumping.
       why: `inet_diag` supports a single-socket query, and it is the right
-      primitive for "what is inode 44078", which is the question anyone
+      primitive for "what is inode 44078", the question anyone
       holding a `/proc/*/fd` entry actually has. Also the cheapest way to
       write a test that watches one socket change state.
 
@@ -270,11 +270,11 @@ tree first.
       becomes exact, not retried, and the compared-count floor can be
       an exact number instead of a minimum. It is also the only way to test
       the empty case honestly, today "sockv prints nothing and `ss` prints
-      nothing" is indistinguishable from a broken program, which is why the
+      nothing" is indistinguishable from a broken program, and that is why the
       count assertions exist.
 - [ ] Ten thousand UNIX sockets in that namespace, to force a dump larger than
       the receive buffer.
-      why: closes the `MSG_TRUNC` mutant, which is the only surviving mutant
+      why: closes the `MSG_TRUNC` mutant, the only surviving mutant
       that represents a real untested branch, not a provable
       equivalence.
 - [ ] Drive `NLM_F_DUMP_INTR` deliberately by churning sockets in a loop while
