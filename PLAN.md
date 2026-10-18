@@ -2,7 +2,8 @@
 
 ## Contract
 
-`sockv [-tux] [-l | -a]`, and `sockv --parse PROTO FILE`.
+`sockv [-tux] [-l | -a] [--port N] [--addr A[/LEN]] [--dev NAME] [--records]`,
+and `sockv --parse PROTO FILE`.
 
 List the kernel's TCP, UDP and UNIX domain sockets by asking the kernel over
 `NETLINK_SOCK_DIAG`, with `inet_diag_req_v2` for TCP and UDP and
@@ -24,6 +25,16 @@ prints as `*`, not `[::]` when the socket is not `IPV6_V6ONLY`, and a
 nonzero `idiag_if` appends `%ifname` to the local end only. For a UNIX socket
 `LOCAL` is `name:inode` and `PEER` is `*:peer-inode`, matching the two columns
 `ss -x` prints.
+
+`--port`, `--addr` and `--dev` are compiled into an `INET_DIAG_REQ_BYTECODE`
+attribute and evaluated by the kernel, so a socket that does not match is
+never sent. They AND together and they test the local end. `unix_diag` has no
+bytecode, so `-x` alongside one of them is a usage error rather than an
+unfiltered answer, and a filter with no family flag defaults to `-t -u`.
+`--records` prints to stderr how many `SOCK_DIAG_BY_FAMILY` records the
+kernel sent; it is part of the interface because it is the only thing that
+distinguishes a filter the kernel ran from a filter run here after the fact,
+and the suite asserts on it.
 
 `-t`, `-u` and `-x` select families and combine. With none given, all three
 are listed. `-l` is listening only, which means `TCP_LISTEN` for TCP, stream
@@ -77,7 +88,11 @@ Ranked by how little of each is ours.
 
 1. `ss` from iproute2, in both directions. A program written by other
    people, reading the same netlink interface from the same kernel. Five
-   differentials: `-tu`, `-tul`, `-x`, `-xl`, `-tux` against `ss -tuanHe`,
+   unfiltered differentials, plus one per kernel-side filter (`sport = :N`,
+   `src A/LEN`, `dev == NAME`, and a conjunction of two), each of which is
+   ALSO compared against the same selection made in userspace over sockv's
+   own unfiltered listing and against the kernel's record counts. The five
+   unfiltered ones are: `-tu`, `-tul`, `-x`, `-xl`, `-tux` against `ss -tuanHe`,
    `-tulnHe`, `-xanHe`, `-xlnHe`, `-tuxanHe`, comparing netid, state, both
    endpoints, inode and uid. Both directions, because a comparison that only
    checks that every socket sockv reports was also reported by `ss` passes for
@@ -91,7 +106,7 @@ Ranked by how little of each is ours.
    `ss -e` reports no uid for UNIX sockets, so the UNIX differentials compare
    five fields and the suite prints a `skip` line saying so.
 
-2. Sockets the suite creates. `t/probe hold` binds and connects nineteen
+2. Sockets the suite creates. `t/probe hold` binds and connects twenty
    sockets whose family, type, state and address it chose, takes each inode
    from `fstat(2)` on its own descriptor: the same number the kernel reports
    as `idiag_inode`, and prints the exact row sockv must produce. Addresses
@@ -101,7 +116,7 @@ Ranked by how little of each is ours.
    but it is the only oracle that can name the socket and the field when
    something is wrong, and the only one that covers shapes the machine does
    not happen to have. A further assertion requires `ss` to report all
-   nineteen inodes, because the differential's socket counts only mean
+   twenty inodes, because the differential's socket counts only mean
    something if the sockets with known identities are inside the population
    being compared.
 
@@ -130,7 +145,7 @@ Ranked by how little of each is ours.
    is reported by sockv and absent from `/proc/net/tcp`, and that asymmetry is
    a passing assertion whose expectation is that something is missing.
 
-5. `make mutants`. Not an oracle for the program but for the suite: 26
+5. `make mutants`. Not an oracle for the program but for the suite: 35
    planted defects, each built and run through the whole suite, with the
    verdict asserted, including for the two documented survivors, so a
    ceiling that disappears fails the script instead of becoming folklore. It
@@ -162,9 +177,10 @@ Ranked by how little of each is ours.
 
 ## Commit sequence
 
-Eleven commits so far, every one of which builds, and every one from the
-second onwards committed through `cq c` so the suite ran against the working
-tree first.
+Twelve steps so far, in twenty-three commits once the fixes and the
+documentation passes between them are counted. Every one builds, and every
+one from the second onwards went through `cq c`, so the suite ran against the
+working tree before the commit existed.
 
 - [x] `Makefile`, `LICENSE`, `.gitignore`, and `sockv.c` with the netlink
       transport, the bounds-checked record walker, and TCP and UDP over
@@ -227,7 +243,7 @@ tree first.
 
 ### Milestone 1: close the gaps the interface already offers
 
-- [ ] `INET_DIAG_REQ_BYTECODE`: a `--port`, `--addr` and `--dev` filter
+- [x] `INET_DIAG_REQ_BYTECODE`: a `--port`, `--addr` and `--dev` filter
       evaluated inside the kernel.
       why: the single largest unimplemented capability of `inet_diag`, and the
       one place sockv is structurally worse than `ss`, not merely
@@ -236,6 +252,40 @@ tree first.
       of the cost of the program. It also comes with the strongest possible
       oracle: the same filter applied in userspace must select the same set,
       and `ss 'sport = :443'` must agree with both.
+      done: `--port N`, `--addr A[/LEN]` and `--dev NAME` compile to
+      `INET_DIAG_BC_S_COND` and `INET_DIAG_BC_DEV_COND`, AND together, and go
+      out as an `INET_DIAG_REQ_BYTECODE` attribute on the dump request. The
+      local end only; there is no `--dport` or `--daddr`. `unix_diag` has no
+      bytecode, so `-x` with a filter is refused with exit 3 and a filter with
+      no family flag defaults to `-t -u`.
+      An output comparison cannot see where a filter ran, so `--records`
+      prints to stderr how many `SOCK_DIAG_BY_FAMILY` records the kernel
+      sent, and the suite asserts that a filtered dump brings back fewer
+      records than an unfiltered one AND exactly as many as sockv prints.
+      Without that pair, a filter applied here after a full dump would pass
+      every assertion in the file. Eight filters, judged three ways each:
+      against the same selection made in userspace over sockv's own
+      unfiltered listing, against `ss` in its own syntax, and against the
+      record counts. 83 assertions became 139.
+      The sockets being selected are the probe's own, so none of it depends
+      on what happens to be running. A twentieth was added for `--dev`: an
+      IPv6 UDP socket bound to `ff02::1` with `sin6_scope_id` set to `lo`,
+      which gives it a nonzero `sk_bound_dev_if` with no capability, where
+      `SO_BINDTODEVICE` would have needed `CAP_NET_RAW`.
+      Eight new mutants, all caught, including the two subtleties that would
+      otherwise have been held in place by nothing: the operand port is host
+      byte order and not `__be16`, and a condition's failure jump points one
+      word PAST the end of the program, because a jump to exactly the end is
+      how the kernel spells "accept".
+      One defect found, and it was in the harness: the record-count
+      assertion took the record count and the row count from two separate
+      runs of sockv, so ordinary churn made them differ and the message it
+      printed accused sockv of the defect the assertion exists to catch. A
+      loop keeping the output caught it on the thirteenth run; twelve before
+      it and six after were green. Both numbers come from one invocation now.
+      Pinned a surprise while writing it: a prefix length of zero still
+      selects by family, so `--addr 0.0.0.0/0` lists the IPv4 sockets and
+      `--addr ::/0` the IPv6 ones. `ss` agrees, so it is the kernel's rule.
 - [ ] `idiag_ext` and the queue, timer and retransmit columns, so `ss -o` and
       the Recv-Q/Send-Q pair become comparable.
       why: two columns of `ss`'s default output are currently not compared by

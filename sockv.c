@@ -436,9 +436,22 @@ struct dump {
 	uint32_t seq;
 	int done;                     /* saw NLMSG_DONE */
 	int intr;                     /* kernel flagged the dump inconsistent */
+	unsigned long recs;           /* records this attempt received */
 	const char *netid;            /* which handler the records belong to */
 	int (*show)(const unsigned char *, size_t, const char *);
 };
+
+/*
+ * How many socket records the kernel actually sent, across every dump of one
+ * invocation. This is not a statistic: it is the only way to tell a filter
+ * the kernel applied from a filter applied here after the fact. Both produce
+ * the same listing, and only this number says which one happened, so
+ * --records exists for the suite to assert on and is documented as part of
+ * the interface for that reason. See METHOD.md: "assert that the new path
+ * ran".
+ */
+static unsigned long records;
+static int show_records;
 
 static int walk(const unsigned char *buf, size_t len, struct dump *d)
 {
@@ -495,6 +508,7 @@ static int walk(const unsigned char *buf, size_t len, struct dump *d)
 			    strerror(-e.error));
 		}
 		case SOCK_DIAG_BY_FAMILY:
+			d->recs++;
 			if (d->show(buf, h.nlmsg_len, d->netid) < 0) return -1;
 			break;
 		default:
@@ -603,6 +617,179 @@ static int recv_dump(struct dump *d)
 	return 0;
 }
 
+/* ------------------------------------------------------------- bytecode */
+
+/*
+ * INET_DIAG_REQ_BYTECODE: the filter the KERNEL runs, which is the whole
+ * point of it. Without one, every socket on the machine crosses the netlink
+ * socket so that userspace can throw most of them away; with one, the kernel
+ * never serialises the sockets that do not match. On a machine with 1500
+ * sockets that is most of the cost of the program, and it is the one place
+ * this program was structurally worse than ss rather than merely smaller.
+ *
+ * The format is a sequence of four-byte ops, each optionally followed by an
+ * operand, and every op is a conditional forward jump: `yes` bytes on if the
+ * test passed, `no` bytes on if it did not. The program accepts the socket if
+ * control reaches exactly the end, and rejects it if a jump lands past the
+ * end -- so a chain of conditions ANDed together is every op falling through
+ * to the next (yes = its own length) with every `no` pointing one word beyond
+ * the program. The kernel's own audit pass (inet_diag_bc_audit) insists that
+ * `no` be at most len+4, which is where that +4 comes from: it is the
+ * canonical "reject" target and not an off-by-one.
+ *
+ * Ports in a bytecode operand are host byte order, not __be16. The kernel
+ * compares against inet->inet_num and ntohs(inet->inet_dport), both already
+ * host order. Addresses are network order. Getting that backwards produces a
+ * filter that quietly matches nothing, which is why the suite asserts that a
+ * filter selects sockets it created rather than only that it selects fewer.
+ */
+#define BCMAX 64
+static union {
+	uint32_t align[BCMAX / 4];      /* an operand needs 4-byte alignment */
+	unsigned char b[BCMAX];
+} bc;
+static size_t bclen;
+static size_t bcoff[3];             /* --port, --addr, --dev at most */
+static unsigned bcops;
+
+/* Append one op plus `extra` operand bytes, and return the operand's offset.
+ * The caller's conditions are bounded at three and the widest operand is a
+ * 24-byte IPv6 hostcond, so BCMAX cannot be reached; it is asserted anyway
+ * because a silent truncation here would be a filter that means something
+ * else. */
+static size_t bc_add(unsigned char code, size_t extra)
+{
+	struct inet_diag_bc_op op;
+
+	if (bclen + sizeof op + extra > BCMAX || bcops >= 3) {
+		fail("internal: the bytecode filter does not fit");
+		exit(EX_FAIL);
+	}
+	op.code = code;
+	op.yes = (unsigned char)(sizeof op + extra);   /* fall through */
+	op.no = 0;                                     /* patched by bc_end */
+	bcoff[bcops++] = bclen;
+	memcpy(bc.b + bclen, &op, sizeof op);
+	memset(bc.b + bclen + sizeof op, 0, extra);
+	bclen += sizeof op + extra;
+	return bclen - extra;
+}
+
+/* Point every condition's failure jump one word past the end of the program,
+ * which is the kernel's encoding for "reject this socket". */
+static void bc_end(void)
+{
+	unsigned i;
+
+	for (i = 0; i < bcops; i++) {
+		struct inet_diag_bc_op op;
+
+		memcpy(&op, bc.b + bcoff[i], sizeof op);
+		op.no = (unsigned short)(bclen - bcoff[i] + 4);
+		memcpy(bc.b + bcoff[i], &op, sizeof op);
+	}
+}
+
+/*
+ * One INET_DIAG_BC_S_COND carries both halves of a "local end looks like
+ * this" test: a port, or -1 for any port, and an address prefix, or a
+ * prefix length of zero for any address. --port and --addr are kept as two
+ * separate ops anyway, because combining them would make the two filters
+ * indistinguishable to a mutation of either.
+ *
+ * A cond of family AF_INET against an AF_INET6 socket matches only a
+ * v4-mapped address; that is the kernel's rule, it is what `ss src 10.0.0.1`
+ * does, and sockv inherits it by sending the same cond to both dumps.
+ */
+static void bc_hostcond(int family, int prefix_len, int port,
+                        const void *addr, size_t alen)
+{
+	struct inet_diag_hostcond c;
+	size_t off;
+
+	memset(&c, 0, sizeof c);
+	c.family = (uint8_t)family;
+	c.prefix_len = (uint8_t)prefix_len;
+	c.port = port;
+	off = bc_add(INET_DIAG_BC_S_COND, sizeof c + alen);
+	memcpy(bc.b + off, &c, sizeof c);
+	if (alen) memcpy(bc.b + off + sizeof c, addr, alen);
+}
+
+static void bc_port(long port)
+{
+	bc_hostcond(AF_UNSPEC, 0, (int)port, NULL, 0);
+}
+
+/* ADDR or ADDR/LEN. Returns 0, or -1 having said what was wrong. */
+static int bc_addr(const char *spec)
+{
+	char host[64];
+	struct in6_addr a6;
+	struct in_addr a4;
+	const char *slash;
+	long bits;
+	size_t n;
+
+	slash = strchr(spec, '/');
+	n = slash ? (size_t)(slash - spec) : strlen(spec);
+	if (n == 0 || n >= sizeof host) {
+		fprintf(stderr, "%s: --addr: '%s' is not an address\n", prog,
+		    spec);
+		return -1;
+	}
+	memcpy(host, spec, n);
+	host[n] = '\0';
+
+	if (inet_pton(AF_INET, host, &a4) == 1) {
+		bits = 32;
+		if (slash) bits = strtol(slash + 1, NULL, 10);
+		if (bits < 0 || bits > 32) {
+			fprintf(stderr, "%s: --addr: prefix length must be "
+			    "0..32 for an IPv4 address\n", prog);
+			return -1;
+		}
+		bc_hostcond(AF_INET, (int)bits, -1, &a4, sizeof a4);
+		return 0;
+	}
+	if (inet_pton(AF_INET6, host, &a6) == 1) {
+		bits = 128;
+		if (slash) bits = strtol(slash + 1, NULL, 10);
+		if (bits < 0 || bits > 128) {
+			fprintf(stderr, "%s: --addr: prefix length must be "
+			    "0..128 for an IPv6 address\n", prog);
+			return -1;
+		}
+		bc_hostcond(AF_INET6, (int)bits, -1, &a6, sizeof a6);
+		return 0;
+	}
+	fprintf(stderr, "%s: --addr: '%s' is not an IPv4 or IPv6 address\n",
+	    prog, host);
+	return -1;
+}
+
+/*
+ * INET_DIAG_BC_DEV_COND tests sk_bound_dev_if, which is the same number that
+ * arrives as idiag_if and that this program renders as the %ifname suffix.
+ * It is SO_BINDTODEVICE, or a bind to a scoped address, and not the interface
+ * the route happens to use -- an unbound socket on a machine with one NIC has
+ * ifindex 0 and no --dev value matches it.
+ */
+static int bc_dev(const char *name)
+{
+	uint32_t idx = if_nametoindex(name);
+	size_t off;
+
+	if (idx == 0) {
+		fprintf(stderr, "%s: --dev: no interface named '%s'\n", prog,
+		    name);
+		return -1;
+	}
+	off = bc_add(INET_DIAG_BC_DEV_COND, sizeof idx);
+	memcpy(bc.b + off, &idx, sizeof idx);
+	return 0;
+}
+
 /* ---------------------------------------------------------------- requests */
 
 /*
@@ -621,11 +808,19 @@ static int run_dump(struct dump *d, const void *req, size_t len)
 	for (i = 0; i < DUMP_TRIES; i++) {
 		int r;
 
+		/* Reset per attempt: a dump the kernel asked us to restart
+		 * delivered records that are about to be delivered again, and
+		 * counting both would hide a duplicate rather than expose
+		 * one. */
 		d->done = d->intr = 0;
+		d->recs = 0;
 		if (nl_send(d->fd, req, len) < 0) return -2;
 		r = recv_dump(d);
 		if (r < 0) return r;
-		if (!d->intr) return 0;
+		if (!d->intr) {
+			records += d->recs;
+			return 0;
+		}
 	}
 	return fail("the socket table kept changing under %d dump attempts "
 	    "(NLM_F_DUMP_INTR); refusing to print an inconsistent listing",
@@ -638,10 +833,12 @@ static int dump_inet(struct dump *d, int family, int proto, uint32_t states,
 	struct {
 		struct nlmsghdr nlh;
 		struct inet_diag_req_v2 r;
+		struct nlattr a;
+		unsigned char prog[BCMAX];
 	} req;
+	size_t len = NLMSG_LENGTH(sizeof req.r);
 
 	memset(&req, 0, sizeof req);
-	req.nlh.nlmsg_len = sizeof req;
 	req.nlh.nlmsg_type = SOCK_DIAG_BY_FAMILY;
 	req.nlh.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
 	req.nlh.nlmsg_seq = ++d->seq;
@@ -653,16 +850,23 @@ static int dump_inet(struct dump *d, int family, int proto, uint32_t states,
 	 * print. INET_DIAG_SKV6ONLY is not requestable anyway -- idiag_ext is
 	 * eight bits wide and that attribute is number 11 -- the kernel sends
 	 * it unasked for every AF_INET6 socket.
-	 *
-	 * shortcut: no INET_DIAG_REQ_BYTECODE either, so every socket crosses
-	 * the netlink socket even when the caller wanted one port. The ceiling
-	 * is the whole socket table per invocation; the upgrade is to compile
-	 * a bytecode program from an address/port/device filter and attach it
-	 * to this request, which is how ss avoids the same cost.
 	 */
+	if (bclen) {
+		/* The offset is computed rather than assumed: an attribute
+		 * has to start on a four-byte boundary after the request
+		 * struct, and both structs happen to be a multiple of four
+		 * on this ABI, but the kernel reads nlmsg_len and not our
+		 * arithmetic about it. */
+		req.a.nla_type = INET_DIAG_REQ_BYTECODE;
+		req.a.nla_len = (uint16_t)(NLA_HDRLEN + bclen);
+		memcpy(req.prog, bc.b, bclen);
+		len = (size_t)((unsigned char *)&req.a -
+		    (unsigned char *)&req) + NLA_HDRLEN + bclen;
+	}
+	req.nlh.nlmsg_len = (uint32_t)len;
 	d->netid = netid;
 	d->show = show_inet;
-	return run_dump(d, &req, sizeof req);
+	return run_dump(d, &req, len);
 }
 
 static int dump_unix(struct dump *d, uint32_t states)
@@ -777,13 +981,29 @@ static int parse_file(const char *proto, const char *path)
 static void usage(FILE *f)
 {
 	fprintf(f,
-	    "usage: %s [-tux] [-l | -a] | %s --parse PROTO FILE\n"
+	    "usage: %s [-tux] [-l | -a] [--port N] [--addr A[/LEN]] [--dev NAME]\n"
+	    "              [--records]\n"
+	    "       %s --parse PROTO FILE\n"
 	    "\n"
 	    "  -t       TCP sockets          -l   listening only\n"
 	    "  -u       UDP sockets          -a   all states (the default)\n"
 	    "  -x       UNIX domain sockets\n"
 	    "\n"
 	    "With no family flag, all of -t -u -x are listed.\n"
+	    "\n"
+	    "Filters, compiled to INET_DIAG_REQ_BYTECODE and run BY THE KERNEL,\n"
+	    "so a socket that does not match is never sent. They combine with\n"
+	    "AND, they match the local end, and they apply to -t and -u only:\n"
+	    "unix_diag has no bytecode, so -x with a filter is refused rather\n"
+	    "than silently filtered here. With a filter and no family flag,\n"
+	    "-t -u is the default instead of -t -u -x.\n"
+	    "\n"
+	    "  --port N             local port is N          (ss: sport = :N)\n"
+	    "  --addr A[/LEN]       local address is A/LEN   (ss: src A/LEN)\n"
+	    "  --dev NAME           bound to interface NAME  (ss: dev == NAME)\n"
+	    "  --records            print to stderr how many records the\n"
+	    "                       kernel sent, which is what distinguishes a\n"
+	    "                       kernel-side filter from a userspace one\n"
 	    "\n"
 	    "  --parse PROTO FILE   walk FILE as a captured netlink reply and\n"
 	    "                       list what it holds. PROTO is tcp, udp or\n"
@@ -799,7 +1019,8 @@ static void usage(FILE *f)
 
 int main(int argc, char **argv)
 {
-	int want_t = 0, want_u = 0, want_x = 0, listening = 0;
+	int want_t = 0, want_u = 0, want_x = 0, listening = 0, explicit_x = 0;
+	int seen[3] = { 0, 0, 0 };          /* --port, --addr, --dev */
 	int i, r = 0;
 	struct dump d;
 
@@ -811,6 +1032,54 @@ int main(int argc, char **argv)
 		if (!strcmp(a, "-h") || !strcmp(a, "--help")) {
 			usage(stdout);
 			return EX_OK;
+		}
+		if (!strcmp(a, "--records")) {
+			show_records = 1;
+			continue;
+		}
+		/* The three filters. Each needs a value, and a missing one is
+		 * a usage error rather than a filter that silently matches
+		 * everything -- which is the failure mode that would make the
+		 * rest of this program look like it worked. */
+		if (!strcmp(a, "--port") || !strcmp(a, "--addr") ||
+		    !strcmp(a, "--dev")) {
+			const char *v;
+			int which = a[2] == 'p' ? 0 : a[2] == 'a' ? 1 : 2;
+
+			/* Twice is refused rather than ANDed. Two local ports
+			 * cannot both be true, so the kernel would hand back
+			 * an empty listing that looks exactly like a correct
+			 * answer to a question nobody asked. */
+			if (seen[which]) {
+				fprintf(stderr, "%s: %s given twice\n",
+				    prog, a);
+				return EX_USAGE;
+			}
+			seen[which] = 1;
+			if (i + 1 >= argc) {
+				fprintf(stderr, "%s: %s needs a value\n",
+				    prog, a);
+				return EX_USAGE;
+			}
+			v = argv[++i];
+			if (!strcmp(a, "--port")) {
+				char *end;
+				long n = strtol(v, &end, 10);
+
+				if (*v == '\0' || *end != '\0' ||
+				    n < 0 || n > 65535) {
+					fprintf(stderr, "%s: --port: '%s' is "
+					    "not a port number 0..65535\n",
+					    prog, v);
+					return EX_USAGE;
+				}
+				bc_port(n);
+			} else if (!strcmp(a, "--addr")) {
+				if (bc_addr(v) < 0) return EX_USAGE;
+			} else {
+				if (bc_dev(v) < 0) return EX_USAGE;
+			}
+			continue;
 		}
 		if (!strcmp(a, "--parse")) {
 			if (i + 2 >= argc) {
@@ -827,7 +1096,7 @@ int main(int argc, char **argv)
 				switch (*c) {
 				case 't': want_t = 1; break;
 				case 'u': want_u = 1; break;
-				case 'x': want_x = 1; break;
+				case 'x': want_x = explicit_x = 1; break;
 				case 'l': listening = 1; break;
 				case 'a': listening = 0; break;
 				default:
@@ -845,7 +1114,25 @@ int main(int argc, char **argv)
 		return EX_USAGE;
 	}
 
-	if (!want_t && !want_u && !want_x) want_t = want_u = want_x = 1;
+	/*
+	 * A filter is inet-only, because INET_DIAG_REQ_BYTECODE is. Asking
+	 * for -x alongside one is refused rather than answered: the two
+	 * honest alternatives are to list every UNIX socket unfiltered, which
+	 * is not what was asked for, or to filter them here in userspace,
+	 * which would mean the same flag sometimes runs in the kernel and
+	 * sometimes does not with nothing in the output saying which.
+	 */
+	if (bclen && explicit_x) {
+		fprintf(stderr, "%s: --port, --addr and --dev are "
+		    "INET_DIAG_REQ_BYTECODE, which unix_diag has no "
+		    "equivalent of; -x cannot be combined with them\n", prog);
+		return EX_USAGE;
+	}
+	if (!want_t && !want_u && !want_x) {
+		want_t = want_u = 1;
+		want_x = !bclen;
+	}
+	bc_end();
 
 	memset(&d, 0, sizeof d);
 	d.fd = nl_open();
@@ -870,6 +1157,7 @@ int main(int argc, char **argv)
 	}
 
 	close(d.fd);
+	if (show_records) fprintf(stderr, "records: %lu\n", records);
 	if (r == -1) return EX_BAD;
 	if (r < 0) return EX_FAIL;
 	return EX_OK;

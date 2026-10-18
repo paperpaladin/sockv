@@ -587,7 +587,7 @@ else
 		bad 'the probe brought its sockets up' \
 		    "$(cat "$TD/inv" "$TD/inverr" 2>/dev/null)"
 	else
-		ok "the probe brought its sockets up (ports $PORT..$((PORT + 4)))"
+		ok "the probe brought its sockets up (ports $PORT..$((PORT + 5)))"
 		"$S" -tux | awk '{print $1, $2, $3, $4, $5, $6, $7}' |
 			sort > "$TD/live"
 		while read -r _kw _tag _rest; do
@@ -670,6 +670,257 @@ else
 			fi
 		else
 			skipt 'ss sees the sockets the probe created' 'no ss(8)'
+		fi
+
+		# =======================================================
+		# INET_DIAG_REQ_BYTECODE: the filter the KERNEL applies
+		# =======================================================
+		# What has to be proved here is not that the output is
+		# right. A filter applied in userspace after a full dump
+		# would produce byte-identical output and pass every
+		# comparison below, so agreement alone cannot tell the two
+		# apart. --records reports how many SOCK_DIAG_BY_FAMILY
+		# records the kernel actually sent, and that number is the
+		# only witness: a bytecode that matches everything, or one
+		# that never reaches the request, shows up there and
+		# nowhere else.
+		#
+		# Three independent checks per filter, and they fail in
+		# different ways:
+		#
+		#  1. the same selection made here in userspace over
+		#     sockv's own unfiltered listing must give the same
+		#     set -- this says the bytecode selects the right
+		#     sockets;
+		#  2. ss, told the equivalent filter in its own syntax,
+		#     must give the same set -- this says sockv and
+		#     another implementation of the same interface agree
+		#     about what the filter means;
+		#  3. the kernel must have sent fewer records with the
+		#     filter than without, and exactly as many as sockv
+		#     printed -- this says the kernel did the work.
+		#
+		# And the sockets being selected are the probe's own, bound
+		# a few lines above with known ports and addresses, so none
+		# of this depends on what happens to be running here.
+
+		# nrecs ARGS...  -- how many records the kernel sent
+		nrecs() {
+			"$S" "$@" --records 2>"$TD/nr" >/dev/null
+			if sanitizer_fired "$(cat "$TD/nr")"; then
+				echo "sanitizer"
+				return
+			fi
+			sed -n 's/^records: //p' "$TD/nr"
+		}
+		# usel AWKCOND -- the same selection, made in userspace over
+		# sockv's own unfiltered listing. The condition is an awk
+		# expression over the full row, so it can test the family
+		# column as well as the local endpoint.
+		usel() {
+			"$S" -tu |
+			    awk "$1 {print \$2, \$3, \$4, \$5, \$6, \$7}" |
+			    sort
+		}
+
+		# bcf NAME FILTER_ARGS SS_FILTER AWKCOND
+		bcf() {
+			_n=$1; _f=$2; _ssf=$3; _re=$4
+			_try=0
+			while [ "$_try" -lt 4 ]; do
+				_try=$((_try + 1))
+				my6 -tu $_f > "$TD/bmine"
+				usel "$_re"  > "$TD/bus"
+				cmp -s "$TD/bmine" "$TD/bus" && break
+			done
+			if cmp -s "$TD/bmine" "$TD/bus"; then
+				ok "$_n: kernel bytecode selects what userspace selection does ($(wc -l < "$TD/bmine" | tr -d ' ') rows)"
+			else
+				bad "$_n: kernel bytecode selects what userspace selection does" \
+				    "$(diff "$TD/bus" "$TD/bmine" | head -20 | sed 's/^/  /')"
+			fi
+			if [ "$HAVE_SS" = yes ]; then
+				difftest "$_n vs ss" 1 "-tu $_f" "-tuanHe $_ssf" 6
+			else
+				skipt "$_n vs ss" 'no ss(8)'
+				skipt "$_n vs ss: teeth" 'no ss(8)'
+			fi
+			# The kernel did the filtering, not this program.
+			#
+			# Both numbers come from ONE invocation, because they
+			# are two facts about the same dump. Taking them from
+			# two runs of sockv made this assertion fail about
+			# once in thirteen on a machine churning sockets: it
+			# reported 36 records against 35 rows and accused
+			# sockv of discarding a record, when what had happened
+			# was that a socket went away between the two runs.
+			# A loop that kept the output found it on the
+			# thirteenth; guessing would not have.
+			"$S" -tu $_f --records >"$TD/brow" 2>"$TD/nr"
+			if sanitizer_fired "$(cat "$TD/nr")"; then
+				bad "$_n: the kernel sent as many records as sockv printed rows" \
+				    "a sanitizer fired" "$(cat "$TD/nr")"
+				return
+			fi
+			_rf=$(sed -n 's/^records: //p' "$TD/nr")
+			_rows=$(wc -l < "$TD/brow" | tr -d ' ')
+			if [ "$_rf" = "$_rows" ]; then
+				ok "$_n: the kernel sent $_rf records and sockv printed $_rows rows"
+			else
+				bad "$_n: the kernel sent $_rf records and sockv printed $_rows rows" \
+				    "sockv discarded records after receiving them;" \
+				    "that is a userspace filter wearing a kernel one's name"
+			fi
+			# This one is inherently two invocations, so it is
+			# re-measured and retried like every other cross-run
+			# comparison here.
+			_try=0
+			_unf=$UNFILT
+			while [ "$_try" -lt 4 ]; do
+				_try=$((_try + 1))
+				case $_unf in '' | sanitizer) break;; esac
+				[ "$_rf" -lt "$_unf" ] && break
+				_unf=$(nrecs -tu)
+			done
+			case $_unf in
+			'' | sanitizer)
+				bad "$_n: the kernel sent fewer records than an unfiltered dump" \
+				    "could not count an unfiltered dump: [$_unf]" ;;
+			*)
+				if [ "$_rf" -lt "$_unf" ]; then
+					ok "$_n: the kernel sent $_rf records, an unfiltered dump $_unf"
+				else
+					bad "$_n: the kernel sent $_rf records, an unfiltered dump $_unf" \
+					    "the bytecode matched everything, or never" \
+					    "reached the request at all"
+				fi ;;
+			esac
+		}
+
+		# expectrow TAG -- the row the probe says that socket must
+		# produce, or empty if the probe skipped it
+		expectrow() {
+			awk -v t="$1" '$1 == "EXPECT" && $2 == t {
+				print $3, $4, $5, $6, $7, $8, $9 }' "$TD/inv"
+		}
+		# inout NAME FILTER_ARGS IN_TAG OUT_TAG -- the socket the
+		# probe created with IN_TAG must be in the filtered listing
+		# and the one with OUT_TAG must not. A filter is only shown
+		# to work when something appears AND something disappears;
+		# a filter matching everything passes the first half alone.
+		inout() {
+			_n=$1; _f=$2; _in=$(expectrow "$3"); _out=$(expectrow "$4")
+			if [ -z "$_in" ] || [ -z "$_out" ]; then
+				skipt "$_n" "the probe could not bind $3 or $4"
+				return
+			fi
+			"$S" -tu $_f |
+			    awk '{print $1, $2, $3, $4, $5, $6, $7}' > "$TD/bsel"
+			if ! grep -qxF "$_in" "$TD/bsel"; then
+				bad "$_n" "this row should have been selected:" \
+				    "  $_in" "got:" \
+				    "$(head -10 "$TD/bsel" | sed 's/^/  /')"
+			elif grep -qxF "$_out" "$TD/bsel"; then
+				bad "$_n" "this row should NOT have been selected:" \
+				    "  $_out"
+			else
+				ok "$_n"
+			fi
+		}
+
+		# One invocation again: with no filter every record the kernel
+		# sends is printed, so these two numbers are equal, and
+		# comparing numbers from two runs would be comparing two
+		# different moments on a machine that does not hold still.
+		"$S" -tu --records >"$TD/brow" 2>"$TD/nr"
+		UNFILT=$(sed -n 's/^records: //p' "$TD/nr")
+		if sanitizer_fired "$(cat "$TD/nr")" || [ -z "$UNFILT" ]; then
+			bad '--records reports the kernel record count' \
+			    "got [$UNFILT]" "$(cat "$TD/nr")"
+			UNFILT=sanitizer
+		elif [ "$UNFILT" = "$(wc -l < "$TD/brow" | tr -d ' ')" ]; then
+			ok "--records reports the kernel record count ($UNFILT)"
+		else
+			bad '--records reports the kernel record count' \
+			    "$UNFILT records for $(wc -l < "$TD/brow") printed rows"
+		fi
+
+		bcf '--port'         "--port $PORT"       "sport = :$PORT" \
+		    "\$4 ~ /:$PORT\$/"
+		bcf '--addr v4'      '--addr 127.0.0.1'   'src 127.0.0.1' \
+		    '$4 ~ /^127\.0\.0\.1[%:]/'
+		bcf '--addr v4 /8'   '--addr 127.0.0.0/8' 'src 127.0.0.0/8' \
+		    '$4 ~ /^127\./'
+		# ss cannot parse a bare ::1 as a source address: it splits
+		# host from port on a colon and gives up. [::1] and ::1/128
+		# are the two forms it accepts, and sockv takes either.
+		bcf '--addr v6'      '--addr ::1'         'src [::1]' \
+		    '$4 ~ /^\[::1\][%:]/'
+		bcf '--dev'          '--dev lo'           'dev == lo' \
+		    '$4 ~ /%lo:/'
+		bcf '--port --dev'   "--port $((PORT + 5)) --dev lo" \
+		    "sport = :$((PORT + 5)) and dev == lo" \
+		    "\$4 ~ /%lo:$((PORT + 5))\$/"
+		# A prefix length of zero still selects by address FAMILY,
+		# which is not what "match any address" sounds like and is
+		# not what the kernel's documented order of tests suggests
+		# either. ss agrees with the kernel here, so this pins a
+		# surprise rather than describing one.
+		bcf '--addr 0.0.0.0/0' '--addr 0.0.0.0/0' 'src 0.0.0.0/0' \
+		    '$1 == "inet"'
+		bcf '--addr ::/0'      '--addr ::/0'      'src ::/0' \
+		    '$1 == "inet6"'
+
+		inout '--port selects the probe listener and not its udp socket' \
+		    "--port $PORT" tcp4-listen udp4-bound
+		inout '--addr 127.0.0.1 selects the v4 listener and not the v6 one' \
+		    '--addr 127.0.0.1' tcp4-listen tcp6-listen
+		inout '--addr ::1 selects the v6 listener and not the v4 one' \
+		    '--addr ::1' tcp6-listen tcp4-listen
+		inout '--dev lo selects the scope-bound socket and not an unbound one' \
+		    '--dev lo' udp6-dev-lo tcp4-listen
+
+		# The other direction, and the sharpest of the lot: a port
+		# nothing on this machine is using must make the kernel send
+		# nothing at all. A filter implemented here after a full dump
+		# prints the same empty listing and reports every record on
+		# the machine.
+		_free=$((PORT + 6))
+		if [ -n "$("$S" -tu | awk -v p=":$_free\$" '$4 ~ p')" ]; then
+			skipt 'a port nothing is bound to returns no records' \
+			    "something is bound to port $_free after all"
+		else
+			"$S" -tu --port "$_free" --records \
+			    >"$TD/brow" 2>"$TD/nr"
+			_rz=$(sed -n 's/^records: //p' "$TD/nr")
+			_oz=$(wc -l < "$TD/brow" | tr -d ' ')
+			if [ "$_rz" = 0 ] && [ "$_oz" = 0 ]; then
+				ok 'a port nothing is bound to returns no records'
+			else
+				bad 'a port nothing is bound to returns no records' \
+				    "kernel sent $_rz records, sockv printed $_oz rows"
+			fi
+		fi
+
+		# unix_diag has no bytecode, so the combination is refused
+		# rather than answered with sockets nobody filtered.
+		t '-x with a filter is refused'  3 -- "$S" -x --port 80
+		t '--port with no value'         3 -- "$S" --port
+		t '--port out of range'          3 -- "$S" --port 65536
+		t '--port is not a number'       3 -- "$S" --port 8o80
+		t '--addr is not an address'     3 -- "$S" --addr localhost
+		t '--addr prefix out of range'   3 -- "$S" --addr 10.0.0.0/33
+		t '--dev names no interface'     3 -- "$S" --dev no-such-dev0
+		# Two local ports cannot both be true. ANDing them would
+		# return an empty listing that reads as a correct answer.
+		t '--port given twice is refused' 3 -- "$S" --port 1 --port 2
+		# A filter with no family flag lists tcp and udp, not unix:
+		# the default cannot include a family the filter cannot reach.
+		if [ -z "$("$S" --port "$PORT" | awk '$1 == "unix"')" ] &&
+		   [ -n "$("$S" | awk '$1 == "unix"')" ]; then
+			ok 'a filter drops unix from the default family set'
+		else
+			bad 'a filter drops unix from the default family set'
 		fi
 	fi
 	kill "$HOLD" 2>/dev/null
