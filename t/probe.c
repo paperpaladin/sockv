@@ -32,6 +32,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netinet/in.h>
+#include <net/if.h>
 #include <netinet/tcp.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -821,6 +822,49 @@ static int hold(int base, const char *dir, int secs)
 			}
 		} else {
 			skip("udp4-connected", "connect");
+		}
+	}
+
+	/*
+	 * --- A socket with a nonzero idiag_if, which is what --dev filters
+	 *     on and the only thing that renders the %ifname suffix.
+	 *
+	 *     SO_BINDTODEVICE needs CAP_NET_RAW and everything here runs
+	 *     unprivileged, so the device binding is obtained the other way:
+	 *     a bind to a link-local-scope IPv6 address with sin6_scope_id
+	 *     set makes the kernel put that ifindex in sk_bound_dev_if, and
+	 *     no capability is involved. ff02::1 is the all-nodes multicast
+	 *     address and lo is the one interface every machine has, so this
+	 *     works without knowing anything about the machine's addressing.
+	 *     Nothing joins a group and nothing is sent.
+	 *
+	 *     Without this the only dev-bound sockets on a machine are
+	 *     whatever happens to be running on it, and the --dev assertions
+	 *     would quietly test nothing on a quiet one.
+	 */
+	{
+		unsigned loidx = if_nametoindex("lo");
+		int fd = -1;
+
+		if (loidx == 0) {
+			skip("udp6-dev-lo", "if_nametoindex(lo)");
+		} else if ((fd = socket(AF_INET6, SOCK_DGRAM, 0)) < 0) {
+			skip("udp6-dev-lo", "socket");
+		} else {
+			memset(&a6, 0, sizeof a6);
+			a6.sin6_family = AF_INET6;
+			a6.sin6_port = htons((uint16_t)(base + 5));
+			a6.sin6_scope_id = loidx;
+			inet_pton(AF_INET6, "ff02::1", &a6.sin6_addr);
+			if (bind(fd, (struct sockaddr *)&a6, sizeof a6) < 0) {
+				skip("udp6-dev-lo", "bind");
+				close(fd);
+			} else {
+				snprintf(loc, sizeof loc, "[ff02::1]%%lo:%d",
+				    base + 5);
+				expect("udp6-dev-lo", "inet6", "udp", "UNCONN",
+				    loc, "[::]:*", ino_of(fd));
+			}
 		}
 	}
 

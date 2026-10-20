@@ -9,6 +9,11 @@ sockv -x          UNIX domain
 sockv -l          listening only
 sockv -a          every state (the default)
 sockv             all three families
+
+sockv -t --port 443             local port 443,   filtered by the kernel
+sockv -tu --addr 127.0.0.0/8    local address in 127/8
+sockv -tu --dev lo              bound to interface lo
+sockv -t --port 443 --records   ... and say how many records the kernel sent
 ```
 
 One row per socket, no header:
@@ -29,13 +34,62 @@ unix  u_dgr UNCONN     @sockv-probe-47310:195741    *:0                         
 socket's inode in the column it labels Port, so both kinds of row have the
 same `address:port` shape and one comparison covers both.
 
+## Filtering in the kernel
+
+`--port`, `--addr` and `--dev` are compiled into an
+`INET_DIAG_REQ_BYTECODE` attribute and attached to the dump request, so the
+kernel never serialises a socket that does not match. They combine with AND,
+they test the **local** end, and `ss` has an equivalent for each:
+
+| sockv | ss |
+|---|---|
+| `--port N` | `sport = :N` |
+| `--addr A[/LEN]` | `src A/LEN` |
+| `--dev NAME` | `dev == NAME` |
+
+The point of a kernel-side filter is not the output, which a userspace filter
+would get right too. It is that the sockets never cross the netlink socket.
+That is not something an output comparison can see, so `--records` prints to
+stderr how many `SOCK_DIAG_BY_FAMILY` records the kernel actually sent:
+
+```
+$ sockv -tu --records >/dev/null
+records: 43
+$ sockv -tu --records --port 53 >/dev/null
+records: 4
+```
+
+43 against 4 is the whole claim, and the suite asserts it: a filtered dump
+must bring back fewer records than an unfiltered one, and exactly as many as
+sockv prints. A bytecode that matches everything, or one that never reaches
+the request, is invisible in the listing and obvious here. `--records` is
+documented as part of the interface for that reason and not hidden behind a
+debug flag.
+
+Three details that are not obvious:
+
+- A port in a bytecode operand is **host** byte order, not `__be16`. The
+  kernel compares against `inet->inet_num`, which is already host order.
+  Addresses in the same operand are network order. A mutant that sends the
+  port big-endian is in `make mutants` and is caught.
+- A condition's failure jump points one word **past** the end of the
+  program. The kernel accepts a socket when control reaches exactly the end
+  and rejects it when a jump lands beyond it, so losing that `+4` turns every
+  filter into a filter that matches everything while still being a program
+  the kernel's own audit pass accepts. Also a mutant, also caught.
+- A prefix length of zero still selects by address **family**.
+  `--addr 0.0.0.0/0` lists the IPv4 sockets and `--addr ::/0` lists the IPv6
+  ones, rather than both listing everything. `ss src 0.0.0.0/0` does the same,
+  so this is the kernel's rule and not a misreading of it, and both cases are
+  in the suite.
+
 ## Build
 
 ```
 make            # sockv, and t/probe
 make test       # the oracle
 make test-asan  # the same suite under ASan and UBSan
-make mutants    # can the suite fail? plants 26 defects and asserts the verdict
+make mutants    # can the suite fail? plants 35 defects and asserts the verdict
 ```
 
 Pure C11, Linux only, no dependencies. The netlink socket is driven with
@@ -84,7 +138,7 @@ socket sockv reports was also reported by `ss` passes trivially for a program
 that reports nothing, so every socket `ss` saw across the whole of sockv's run
 must also appear in sockv's output. And because two empty sets compare equal,
 each differential emits a **second, separately named assertion about how many
-sockets it compared**: 1597 in the run below, and a count under the floor
+sockets it compared**: 1544 in the run below, and a count under the floor
 is a failure, not a pass.
 
 The live-system race is handled by sandwiching, not by hoping. `ss`
@@ -95,8 +149,17 @@ programs take turns fall outside both claims, and that is what they are. The
 sandwich retries up to four times, so only a mismatch that survives every
 attempt fails: a real defect mismatches on all of them, while churn moves.
 
+Each of the eight filters is judged three separate ways, because the three
+fail differently: the same selection made in userspace over sockv's own
+unfiltered listing must give the same set (the bytecode picks the right
+sockets); `ss`, told the equivalent filter in its own syntax, must give the
+same set (two implementations agree about what the filter means); and the
+kernel must have sent fewer records with the filter than without (the kernel
+did the work). Only the third can tell a kernel-side filter from a userspace
+one.
+
 2. Sockets the suite creates itself. `t/probe hold` binds and connects
-nineteen sockets whose family, type, state and address it chose, reads each
+twenty sockets whose family, type, state and address it chose, reads each
 one's inode out of `fstat(2)` on its own descriptor. The same number the
 kernel reports as `idiag_inode`, and prints the exact row sockv must
 produce. Addresses in those expectations are printed from the numbers
@@ -105,8 +168,8 @@ cannot share a formatting mistake with sockv. This is what makes a failure
 specific: the differential can only say "these sets differ", and these
 assertions say which socket and which field.
 
-A further assertion checks that `ss` reports all nineteen of those inodes,
-because a socket count of 1597 and a set of nineteen known sockets are each
+A further assertion checks that `ss` reports all twenty of those inodes,
+because a socket count of 1544 and a set of twenty known sockets are each
 weak alone and strong together.
 
 3. `/proc/net/{tcp,tcp6,udp,udp6,unix}`, weakest, and ranked last for a
@@ -135,17 +198,17 @@ this machine happens to have.
 ```
 sockv vs ss utility, iproute2-6.15.0 on 7.2.8-200.fc44.x86_64
 
-ok    tcp+udp, all states: ss agrees both ways (69 sockets)
-ok    tcp+udp, all states: compared 69 sockets (>= 4)
-ok    tcp+udp, listening: ss agrees both ways (18 sockets)
-ok    tcp+udp, listening: compared 18 sockets (>= 1)
-ok    unix, all states: ss agrees both ways (1528 sockets)
-ok    unix, all states: compared 1528 sockets (>= 4)
-ok    unix, listening: ss agrees both ways (165 sockets)
-ok    unix, listening: compared 165 sockets (>= 1)
-ok    tcp+udp+unix together: ss agrees both ways (1597 sockets)
-ok    tcp+udp+unix together: compared 1597 sockets (>= 8)
-ok    -t -u -x partition the default listing (1597 rows)
+ok    tcp+udp, all states: ss agrees both ways (100 sockets)
+ok    tcp+udp, all states: compared 100 sockets (>= 4)
+ok    tcp+udp, listening: ss agrees both ways (25 sockets)
+ok    tcp+udp, listening: compared 25 sockets (>= 1)
+ok    unix, all states: ss agrees both ways (1452 sockets)
+ok    unix, all states: compared 1452 sockets (>= 4)
+ok    unix, listening: ss agrees both ways (178 sockets)
+ok    unix, listening: compared 178 sockets (>= 1)
+ok    tcp+udp+unix together: ss agrees both ways (1552 sockets)
+ok    tcp+udp+unix together: compared 1552 sockets (>= 8)
+ok    -t -u -x partition the default listing (1552 rows)
 ok    each family flag yields only its own netids
 skip  unix uid against ss  (ss -e does not report uid for unix sockets)
 ok    no duplicate rows
@@ -187,11 +250,14 @@ ok    --parse with an unknown protocol
 ok    --parse with a missing file
 ok    --parse with no arguments
 ok    --parse of an empty file
-ok    /proc/net/{tcp,tcp6,udp,udp6} inode+uid+port (69 rows)
-ok    /proc/net/{tcp,tcp6,udp,udp6} inode+uid+port: compared 69 rows (>= 4)
-ok    /proc/net/unix inode+name (1528 rows)
-ok    /proc/net/unix inode+name: compared 1528 rows (>= 4)
-ok    the probe brought its sockets up (ports 49848..49852)
+ok    /proc/net/{tcp,tcp6,udp,udp6} inode+uid+port (100 rows)
+ok    /proc/net/{tcp,tcp6,udp,udp6} inode+uid+port: compared 100 rows (>= 4)
+ok    /proc/net/unix inode+name (1452 rows)
+ok    /proc/net/unix inode+name: compared 1452 rows (>= 4)
+note: 0 /proc/net/unix row(s) carry inode 0 and are excluded;
+      sock_diag does not enumerate a socket with no struct socket
+ok    /proc/net/unix: the inode-0 exclusion stays small
+ok    the probe brought its sockets up (ports 47432..47437)
 ok    created: tcp4-listen
 ok    created: tcp4-client
 ok    created: tcp4-server
@@ -203,6 +269,7 @@ ok    created: udp4-bound
 ok    created: udp6-bound
 ok    created: udp4-connected
 ok    created: udp4-connected-peer
+ok    created: udp6-dev-lo
 ok    created: unix-path-listen
 ok    created: unix-pair-server
 ok    created: unix-pair-client
@@ -213,13 +280,68 @@ ok    created: unix-socketpair-a
 ok    created: unix-socketpair-b
 ok    unix name containing spaces appears verbatim
 ok    bound-only TCP socket is absent from /proc/net/tcp
-ok    ss sees all 19 sockets the probe created
+ok    ss sees all 20 sockets the probe created
+ok    --records reports the kernel record count (112)
+ok    --port: kernel bytecode selects what userspace selection does (4 rows)
+ok    --port vs ss: ss agrees both ways (4 sockets)
+ok    --port vs ss: compared 4 sockets (>= 1)
+ok    --port vs ss: the kernel sent 4 records and sockv printed 4 rows
+ok    --port vs ss: the kernel sent 4 records, an unfiltered dump 112
+ok    --addr v4: kernel bytecode selects what userspace selection does (43 rows)
+ok    --addr v4 vs ss: ss agrees both ways (43 sockets)
+ok    --addr v4 vs ss: compared 43 sockets (>= 1)
+ok    --addr v4 vs ss: the kernel sent 43 records and sockv printed 43 rows
+ok    --addr v4 vs ss: the kernel sent 43 records, an unfiltered dump 112
+ok    --addr v4 /8: kernel bytecode selects what userspace selection does (47 rows)
+ok    --addr v4 /8 vs ss: ss agrees both ways (47 sockets)
+ok    --addr v4 /8 vs ss: compared 47 sockets (>= 1)
+ok    --addr v4 /8 vs ss: the kernel sent 47 records and sockv printed 47 rows
+ok    --addr v4 /8 vs ss: the kernel sent 47 records, an unfiltered dump 112
+ok    --addr v6: kernel bytecode selects what userspace selection does (38 rows)
+ok    --addr v6 vs ss: ss agrees both ways (38 sockets)
+ok    --addr v6 vs ss: compared 38 sockets (>= 1)
+ok    --addr v6 vs ss: the kernel sent 38 records and sockv printed 38 rows
+ok    --addr v6 vs ss: the kernel sent 38 records, an unfiltered dump 112
+ok    --dev: kernel bytecode selects what userspace selection does (3 rows)
+ok    --dev vs ss: ss agrees both ways (3 sockets)
+ok    --dev vs ss: compared 3 sockets (>= 1)
+ok    --dev vs ss: the kernel sent 3 records and sockv printed 3 rows
+ok    --dev vs ss: the kernel sent 3 records, an unfiltered dump 112
+ok    --port --dev: kernel bytecode selects what userspace selection does (1 rows)
+ok    --port --dev vs ss: ss agrees both ways (1 sockets)
+ok    --port --dev vs ss: compared 1 sockets (>= 1)
+ok    --port --dev vs ss: the kernel sent 1 records and sockv printed 1 rows
+ok    --port --dev vs ss: the kernel sent 1 records, an unfiltered dump 112
+ok    --addr 0.0.0.0/0: kernel bytecode selects what userspace selection does (65 rows)
+ok    --addr 0.0.0.0/0 vs ss: ss agrees both ways (65 sockets)
+ok    --addr 0.0.0.0/0 vs ss: compared 65 sockets (>= 1)
+ok    --addr 0.0.0.0/0 vs ss: the kernel sent 65 records and sockv printed 65 rows
+ok    --addr 0.0.0.0/0 vs ss: the kernel sent 65 records, an unfiltered dump 112
+ok    --addr ::/0: kernel bytecode selects what userspace selection does (47 rows)
+ok    --addr ::/0 vs ss: ss agrees both ways (47 sockets)
+ok    --addr ::/0 vs ss: compared 47 sockets (>= 1)
+ok    --addr ::/0 vs ss: the kernel sent 47 records and sockv printed 47 rows
+ok    --addr ::/0 vs ss: the kernel sent 47 records, an unfiltered dump 112
+ok    --port selects the probe listener and not its udp socket
+ok    --addr 127.0.0.1 selects the v4 listener and not the v6 one
+ok    --addr ::1 selects the v6 listener and not the v4 one
+ok    --dev lo selects the scope-bound socket and not an unbound one
+ok    a port nothing is bound to returns no records
+ok    -x with a filter is refused
+ok    --port with no value
+ok    --port out of range
+ok    --port is not a number
+ok    --addr is not an address
+ok    --addr prefix out of range
+ok    --dev names no interface
+ok    --port given twice is refused
+ok    a filter drops unix from the default family set
 ok    unknown option
 ok    stray argument
 ok    --help exits 0
 ok    listing exits 0
 
-83 passed, 0 failed, 1 skipped
+139 passed, 0 failed, 1 skipped
 ```
 
 Exit status is part of the interface, because the suite asserts on it: `0`
@@ -233,44 +355,138 @@ version and the reason. A skip is never dressed up as a pass.
 
 ## Have I watched this harness fail?
 
-`make mutants` plants 26 defects in `sockv.c` with `sed`, builds each one, runs
+`make mutants` plants 35 defects in `sockv.c` with `sed`, builds each one, runs
 the whole suite against the broken binary, and asserts the verdict. Two
 mutants are expected to *survive*, and asserting that is the point. A
 survivor that starts being caught fails the script too, because at that moment
 this README is the thing that has become wrong.
 
 ```
-ok     (no defect planted)                    83 passed, 0 failed, 1 skipped
+ok     (no defect planted)                    139 passed, 0 failed, 1 skipped
 
-ok     port printed without ntohs             caught by 27 assertion(s)
-ok     AF_INET address read as 16 bytes       caught by 17 assertion(s)
-ok     INET_DIAG_SKV6ONLY ignored             caught by 6 assertion(s)
-ok     ifindex scope suffix dropped           caught by 5 assertion(s)
-ok     uid hardcoded to zero                  caught by 22 assertion(s)
-ok     local and peer endpoints swapped       caught by 18 assertion(s)
+ok     port printed without ntohs             caught by 42 assertion(s)
+         tcp+udp, all states: ss agrees both ways
+         tcp+udp, listening: ss agrees both ways
+         tcp+udp+unix together: ss agrees both ways
+ok     AF_INET address read as 16 bytes       caught by 26 assertion(s)
+         tcp+udp, all states: ss agrees both ways
+         tcp+udp, listening: ss agrees both ways
+         tcp+udp+unix together: ss agrees both ways
+ok     INET_DIAG_SKV6ONLY ignored             caught by 7 assertion(s)
+         tcp+udp, all states: ss agrees both ways
+         tcp+udp, listening: ss agrees both ways
+         tcp+udp+unix together: ss agrees both ways
+ok     ifindex scope suffix dropped           caught by 14 assertion(s)
+         tcp+udp, all states: ss agrees both ways
+         tcp+udp, listening: ss agrees both ways
+         tcp+udp+unix together: ss agrees both ways
+ok     uid hardcoded to zero                  caught by 35 assertion(s)
+         tcp+udp, all states: ss agrees both ways
+         tcp+udp, listening: ss agrees both ways
+         v4 endpoint
+ok     local and peer endpoints swapped       caught by 34 assertion(s)
+         tcp+udp, all states: ss agrees both ways
+         tcp+udp, listening: ss agrees both ways
+         tcp+udp+unix together: ss agrees both ways
 ok     abstract name loses its @              caught by 8 assertion(s)
+         unix, all states: ss agrees both ways
+         unix, listening: ss agrees both ways
+         tcp+udp+unix together: ss agrees both ways
 ok     u_dgr relabelled u_str                 caught by 5 assertion(s)
+         unix, all states: ss agrees both ways
+         unix, listening: ss agrees both ways
+         tcp+udp+unix together: ss agrees both ways
 ok     UNIX_DIAG_PEER ignored                 caught by 7 assertion(s)
+         unix, all states: ss agrees both ways
+         tcp+udp+unix together: ss agrees both ways
+         unix unnamed, with a peer inode
 ok     every unix socket reads as unnamed     caught by 15 assertion(s)
+         unix, all states: ss agrees both ways
+         unix, listening: ss agrees both ways
+         tcp+udp+unix together: ss agrees both ways
 ok     -l uses TCP_LISTEN for UDP             caught by 1 assertion(s)
-ok     -l treats u_dgr like u_str             caught by 1 assertion(s)
-ok     only the first record is read          caught by 25 assertion(s)
+         tcp+udp, listening: ss agrees both ways
+ok     -l drops the TCP_CLOSE half of the unix state mask caught by 1 assertion(s)
+         unix, listening: ss agrees both ways
+ok     bytecode attribute never attached      caught by 24 assertion(s)
+         --port: kernel bytecode selects what userspace selection does
+         --port vs ss: ss agrees both ways
+         --port vs ss: the kernel sent 91 records, an unfiltered dump 91
+ok     filter tests the peer end, not the local caught by 13 assertion(s)
+         --port: kernel bytecode selects what userspace selection does
+         --port vs ss: ss agrees both ways
+         --addr v4: kernel bytecode selects what userspace selection does
+ok     hostcond port left as -1 (any port)    caught by 7 assertion(s)
+         --port: kernel bytecode selects what userspace selection does
+         --port vs ss: ss agrees both ways
+         --port vs ss: the kernel sent 83 records, an unfiltered dump 83
+ok     hostcond port sent big-endian          caught by 17 assertion(s)
+         --port: kernel bytecode selects what userspace selection does
+         --port vs ss: ss agrees both ways
+         --addr v4: kernel bytecode selects what userspace selection does
+ok     hostcond prefix length zeroed          caught by 6 assertion(s)
+         --addr v4: kernel bytecode selects what userspace selection does
+         --addr v4 vs ss: ss agrees both ways
+         --addr v4 /8: kernel bytecode selects what userspace selection does
+ok     reject jump lands on the end, not past it caught by 29 assertion(s)
+         --port: kernel bytecode selects what userspace selection does
+         --port vs ss: ss agrees both ways
+         --port vs ss: the kernel sent 89 records, an unfiltered dump 89
+ok     DEV_COND ifindex operand never written caught by 5 assertion(s)
+         --dev: kernel bytecode selects what userspace selection does
+         --dev vs ss: ss agrees both ways
+         --port --dev: kernel bytecode selects what userspace selection does
+ok     the record counter does not count      caught by 17 assertion(s)
+         --records reports the kernel record count
+         --port vs ss: the kernel sent 0 records and sockv printed 4 rows
+         --port vs ss: the kernel sent 0 records, an unfiltered dump 0
+ok     a filter flag given twice is quietly ANDed caught by 1 assertion(s)
+         --port given twice is refused
+ok     only the first record is read          caught by 40 assertion(s)
+         tcp+udp, all states: ss agrees both ways
+         tcp+udp, listening: ss agrees both ways
+         unix, all states: ss agrees both ways
 ok     advance by nlmsg_len, not aligned      caught by 1 assertion(s)
+         unaligned nlmsg_len keeps the next record
 ok     nlmsg_len lower bound deleted          caught by 2 assertion(s)
+         nlmsg_len below the header size
+         nlmsg_len of zero
 ok     nlmsg_len upper bound deleted          caught by 2 assertion(s)
+         nlmsg_len past the end of the buffer
+         nlmsg_len of 0xffffffff does not wrap
 ok     short-buffer check deleted             caught by 2 assertion(s)
+         buffer shorter than an nlmsghdr
+         truncated final record
 ok     nla_len lower bound deleted            caught by 1 assertion(s)
+         nla_len below the attribute header
 ok     nla_len upper bound deleted            caught by 1 assertion(s)
+         nla_len past the end of its message
 ok     payload size check deleted             caught by 1 assertion(s)
+         payload too small for inet_diag_msg
 ok     unix name length check deleted         caught by 1 assertion(s)
+         unix name longer than sun_path
 ok     u8 attribute length check deleted      caught by 1 assertion(s)
+         u8 attribute with no payload
 ok     NLM_F_DUMP_INTR ignored                caught by 1 assertion(s)
+         NLM_F_DUMP_INTR is not a listing
 ok     attribute end-of-buffer loosened by 4  caught by 1 assertion(s)
+         u8 attribute with no payload
 ok     record end-of-buffer loosened by 4     survived, as documented
+         provably equivalent: the test fires after the record has been
+         processed, so the mutant only declines to look for a further
+         record in fewer than four remaining bytes, and an nlmsghdr is
+         sixteen. The same change to the attribute walker above is a real
+         defect, because an attribute can be four bytes long
 ok     MSG_TRUNC check deleted                survived, as documented
+         unreachable on this machine: the receive buffer is 256KB and the
+         kernel caps a dump datagram well below that, so nothing here can
+         produce a truncated datagram to notice. Only a netns with tens of
+         thousands of sockets, or a smaller buffer, would exercise it
 
 AddressSanitizer, both netlink bounds deleted:
 ok     overread is reported                   heap-buffer-overflow, exit 86
+
+37 passed, 0 failed
 ```
 
 The counts move a little from run to run, because most of them include the
@@ -295,7 +511,7 @@ dropped record fails twenty-five.
   namespace with tens of thousands of sockets, or a deliberately smaller
   buffer, would exercise it.
 
-### Three defects found, and two of them were in the harness
+### Four defects found, and three of them were in the harness
 
 - The handler was reading the attribute area out of its own stack frame.
   `walk()` copied each `nlmsghdr` into a local and passed `&local` to the
@@ -311,6 +527,18 @@ dropped record fails twenty-five.
   so the request asks for both states and the display drops the combinations
   that are not listening. Found by the differential on its first run against
   UNIX sockets.
+- The filter's record-count assertion raced itself. It took the number of
+  records the kernel sent and the number of rows sockv printed from two
+  separate runs of sockv, so a socket that went away in between made them
+  differ, and the message it printed was "sockv discarded records after
+  receiving them" -- accusing the program of the exact defect the assertion
+  exists to catch. It failed on the thirteenth run of a loop that kept the
+  output, reporting 36 records against 35 rows; the first twelve were green
+  and the first six after that were green too, so a summary line would not
+  have found it. Both numbers now come from one invocation, because they are
+  two facts about the same dump. The one cross-run comparison that is left,
+  filtered against unfiltered, is re-measured and retried like every other
+  cross-run comparison in the file.
 - `make test-asan` could not fail. With both netlink bounds deleted, the
   sanitised build read past the end of the reply and AddressSanitizer said
   nothing: `--parse` was reading its fixtures into a fixed one-megabyte
@@ -363,19 +591,43 @@ above.
   sockets, so the UNIX differentials compare five fields where the inet ones
   compare six, and the suite prints that as an explicit `skip` line rather
   than quietly comparing less. The UNIX uid column is checked against the
-  nineteen sockets the probe creates, where the expected value is known.
+  twenty sockets the probe creates, where the expected value is known.
 - No `UNIX_DIAG_VFS`, `ICONS`, `RQLEN` or `SHUTDOWN`. `ss -e` prints the
   socket file's `ino:`/`dev:` for a path-bound UNIX socket, and the pending
   connection queue for a listener. Not implemented.
 
 ### Filtering
 
-- Only state filtering, and only `-l` or all. `inet_diag` accepts an
-  `INET_DIAG_REQ_BYTECODE` attribute that filters on address, port, interface,
-  cgroup and mark **inside the kernel**, which is how `ss 'dport = :443'`
-  avoids transferring sockets the caller will discard. sockv transfers
-  everything and has no address or port filter at all. This is the single
-  largest unimplemented capability of the interface.
+- The local end only. `--port`, `--addr` and `--dev` compile to
+  `INET_DIAG_BC_S_COND` and `INET_DIAG_BC_DEV_COND`. There is no `--dport` or
+  `--daddr`, although the kernel has `INET_DIAG_BC_D_COND` and `ss` exposes it
+  as `dport` and `dst`. Adding them is one more op code and one more flag; it
+  is not done, so "which sockets are talking to 10.0.0.1" is a question this
+  program cannot ask the kernel.
+- No `INET_DIAG_BC_MARK_COND` (needs `CAP_NET_ADMIN`), no
+  `INET_DIAG_BC_CGROUP_COND`, no `INET_DIAG_BC_AUTO`, and no OR or NOT. The
+  filters AND together and that is all the structure there is. `ss` has a
+  whole expression language with parentheses; this is three flags.
+- UNIX sockets cannot be filtered at all, because `unix_diag` has no
+  bytecode. `-x` together with a filter is **refused** with exit 3 rather
+  than answered. The two alternatives were to list every UNIX socket
+  unfiltered, which is not what was asked for, or to filter them here in
+  userspace, which would mean the same flag runs in the kernel for one family
+  and in this process for another with nothing in the output saying which.
+  As a consequence `sockv --port 53` with no family flag defaults to `-t -u`
+  and not to `-t -u -x`.
+- `--dev` matches `sk_bound_dev_if`, which is `SO_BINDTODEVICE` or a bind to
+  a scoped address, not the interface a packet would leave by. An ordinary
+  socket on a machine with one NIC has ifindex 0 and no `--dev` value selects
+  it. This is `ss dev ==`'s meaning too.
+- Creating a dev-bound socket to test `--dev` against needs no privilege
+  only because of a trick: `SO_BINDTODEVICE` requires `CAP_NET_RAW`, so the
+  probe binds an IPv6 UDP socket to `ff02::1` with `sin6_scope_id` set to
+  `lo` instead, which makes the kernel fill in `sk_bound_dev_if` with no
+  capability involved. If that bind ever fails the `--dev` assertions report
+  a skip naming the socket, and are not silently narrowed to whatever
+  dev-bound sockets the machine happens to have.
+- Only state filtering otherwise, and only `-l` or all.
 - No equivalent of `ss`'s default state filter. `ss -tn` with no `-a`
   applies a state mask that is not documented anywhere and that this project
   declined to reverse-engineer, because reproducing it would be mimicry of
@@ -445,6 +697,16 @@ above.
 - `SO_RCVBUF` is set best-effort and not checked. On a machine with enough
   sockets the kernel can still run out of space mid-dump; `recvmsg` returns
   `ENOBUFS` and sockv exits 1 naming it.
+- The bytecode program lives in a fixed 64-byte static buffer, which is
+  larger than any program this program builds (48 bytes is the maximum: three
+  conditions, the widest an IPv6 host condition). That is the shape that makes
+  AddressSanitizer blind, the same shape `--parse`'s fixture buffer had, and
+  it is mitigated here by bound rather than by trimming: the one function that
+  writes to it checks the remaining room and the condition count on every
+  append and exits rather than truncating. A write that stayed inside the
+  array but past the program would still be invisible. The exact-allocation
+  fix is not worth a `malloc` for 48 bytes, and this sentence is the honest
+  version of that trade.
 - `nlmsg_seq` is not matched. Safe only because one request is outstanding
   at a time on a socket nobody else holds, and marked `shortcut:` where that
   assumption lives. The datagram's source port *is* checked, so a reply from
@@ -470,13 +732,15 @@ above.
 
 ## Design
 
-One file, `sockv.c`, 866 lines, about a quarter of them comments explaining why
+One file, `sockv.c`, 1152 lines, about a quarter of them comments explaining why
 the kernel or `ss` insists on something.
 
 ```
-parse args  ->  socket(AF_NETLINK, SOCK_RAW, NETLINK_SOCK_DIAG)
+parse args  ->  compile --port/--addr/--dev to bytecode
+            ->  socket(AF_NETLINK, SOCK_RAW, NETLINK_SOCK_DIAG)
             ->  per family and protocol:
                   sendmsg  inet_diag_req_v2 | unix_diag_req, NLM_F_DUMP
+                           + INET_DIAG_REQ_BYTECODE when a filter was given
                   recvmsg  -> walk() the records -> show_inet | show_unix
                   NLM_F_DUMP_INTR -> start that dump again
 ```

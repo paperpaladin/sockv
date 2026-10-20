@@ -149,6 +149,37 @@ mutant '-l uses TCP_LISTEN for UDP' caught \
 mutant '-l drops the TCP_CLOSE half of the unix state mask' caught \
 	's/m.udiag_state != TCP_LISTEN \&\& m.udiag_state != TCP_CLOSE/m.udiag_state != TCP_LISTEN/' ''
 
+# --- INET_DIAG_REQ_BYTECODE: the filter the kernel runs -------------------
+# The output assertions alone cannot judge most of these, because a filter
+# applied in userspace after a full dump produces identical output. The pair
+# that can are the record counts: the kernel must send fewer records with a
+# filter than without, and exactly as many as sockv prints.
+mutant 'bytecode attribute never attached' caught \
+	's/if (bclen) {/if (0) {/' ''
+mutant 'filter tests the peer end, not the local' caught \
+	's/INET_DIAG_BC_S_COND/INET_DIAG_BC_D_COND/' ''
+mutant 'hostcond port left as -1 (any port)' caught \
+	's/c.port = port;/c.port = -1;/' ''
+mutant 'hostcond port sent big-endian' caught \
+	's/c.port = port;/c.port = (int)htons((uint16_t)port);/' ''
+mutant 'hostcond prefix length zeroed' caught \
+	's/c.prefix_len = (uint8_t)prefix_len;/c.prefix_len = 0;/' ''
+# The kernel reads a jump past the end of the program as "reject" and a jump
+# to exactly the end as "accept", so losing the +4 turns every filter into a
+# filter that matches everything -- while still being a legal program the
+# kernel's own audit pass accepts.
+mutant 'reject jump lands on the end, not past it' caught \
+	's/bclen - bcoff\[i\] + 4/bclen - bcoff[i]/' ''
+mutant 'DEV_COND ifindex operand never written' caught \
+	's/memcpy(bc.b + off, &idx, sizeof idx);/(void)idx;/' ''
+# The witness itself. --records is the only thing that distinguishes a
+# kernel-side filter from a userspace one, so a counter that does not count
+# has to turn the suite red or the distinction is decoration.
+mutant 'the record counter does not count' caught \
+	's/d->recs++;//' ''
+mutant 'a filter flag given twice is quietly ANDed' caught \
+	's/if (seen\[which\]) {/if (0) {/' ''
+
 # --- the record walker: framing and bounds --------------------------------
 mutant 'only the first record is read' caught \
 	's/case SOCK_DIAG_BY_FAMILY:/case SOCK_DIAG_BY_FAMILY: d->done = 1;/' ''
