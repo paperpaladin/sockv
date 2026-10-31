@@ -148,6 +148,17 @@ static void attr_badlen(uint16_t type, uint16_t claim, const void *v, size_t n)
  * 10.0.0.1:443, inode 4242, uid 1001 -- nothing the live machine would
  * produce, so a harness assertion on the exact row cannot pass by accident.
  */
+/*
+ * The queue and timer fields of inet_diag_msg, which the -o fixtures set and
+ * nothing else cares about. File scope rather than five more parameters to
+ * inet_rec, because the sixteen cases that predate them all want zero, which
+ * is what the kernel sends for a socket with nothing queued and no timer
+ * running. Each case that wants otherwise sets them immediately before the
+ * call and build() runs exactly once per process.
+ */
+static uint32_t rec_rq, rec_wq, rec_exp;
+static uint8_t rec_timer, rec_retrans;
+
 static size_t inet_rec(int family, int state, uint16_t sport, uint16_t dport,
                        const char *src, const char *dst, uint32_t ifindex,
                        uint32_t inode, uint32_t uid, int v6only)
@@ -158,6 +169,11 @@ static size_t inet_rec(int family, int state, uint16_t sport, uint16_t dport,
 	memset(&m, 0, sizeof m);
 	m.idiag_family = (uint8_t)family;
 	m.idiag_state = (uint8_t)state;
+	m.idiag_timer = rec_timer;
+	m.idiag_retrans = rec_retrans;
+	m.idiag_expires = rec_exp;
+	m.idiag_rqueue = rec_rq;
+	m.idiag_wqueue = rec_wq;
 	m.id.idiag_sport = htons(sport);
 	m.id.idiag_dport = htons(dport);
 	if (src) inet_pton(family, src, m.id.idiag_src);
@@ -209,6 +225,123 @@ static void done(void)
 static int build(const char *c)
 {
 	size_t off;
+
+	/* --- the optional extensions ----------------------------------- */
+	/*
+	 * No socket on this machine is in the zero-window probe state, has
+	 * retransmitted anything, or runs a congestion control other than
+	 * cubic, so these are the only way to reach those renderings. The
+	 * values are deliberately ones the live system cannot produce, so an
+	 * assertion on the exact row cannot pass by accident.
+	 */
+	if (!strcmp(c, "ext-full")) {
+		uint32_t mem[SK_MEMINFO_VARS] = { 1, 2, 3, 4, 5, 6, 7, 8, 9 };
+
+		rec_rq = 111; rec_wq = 222; rec_exp = 3456;
+		rec_timer = 4; rec_retrans = 7;
+		off = inet_rec(AF_INET, TCP_ESTABLISHED, 8080, 443,
+		    "127.0.0.1", "10.0.0.1", 0, 4260, 1001, 0);
+		attr(INET_DIAG_SKMEMINFO, mem, sizeof mem);
+		attr(INET_DIAG_CONG, "bbr", 4);
+		rec_end(off);
+		done();
+		return 0;
+	}
+	if (!strcmp(c, "ext-timer-unknown")) {
+		/* A timer number past the end of ss's table. A newer kernel
+		 * growing the enum must not lose the socket. */
+		rec_timer = 9; rec_exp = 1;
+		off = inet_rec(AF_INET, TCP_ESTABLISHED, 8080, 443,
+		    "127.0.0.1", "10.0.0.1", 0, 4261, 1001, 0);
+		rec_end(off);
+		done();
+		return 0;
+	}
+	if (!strcmp(c, "ext-skmem-wide")) {
+		/* A kernel with one more counter than this build knows. Read
+		 * to the width we have rather than refused, which is the same
+		 * rule as an unknown attribute type: the enum grows. */
+		uint32_t mem[SK_MEMINFO_VARS + 1] = {
+			1, 2, 3, 4, 5, 6, 7, 8, 9, 10
+		};
+
+		off = inet_rec(AF_INET, TCP_ESTABLISHED, 8080, 443,
+		    "127.0.0.1", "10.0.0.1", 0, 4262, 1001, 0);
+		attr(INET_DIAG_SKMEMINFO, mem, sizeof mem);
+		rec_end(off);
+		done();
+		return 0;
+	}
+	if (!strcmp(c, "ext-skmem-short")) {
+		uint32_t mem[SK_MEMINFO_VARS - 1] = { 0 };
+
+		off = inet_rec(AF_INET, TCP_ESTABLISHED, 8080, 443,
+		    "127.0.0.1", "10.0.0.1", 0, 4263, 1001, 0);
+		attr(INET_DIAG_SKMEMINFO, mem, sizeof mem);
+		rec_end(off);
+		done();
+		return 0;
+	}
+	if (!strcmp(c, "ext-skmem-short-last")) {
+		/*
+		 * The same short array, with nothing after it: no padding,
+		 * because thirty-two bytes is already aligned, and no
+		 * NLMSG_DONE. That is what decides whether AddressSanitizer
+		 * can see the overread, and it is a property of the FIXTURE
+		 * rather than of the program. With a DONE record following,
+		 * reading four bytes past this attribute lands inside the
+		 * same allocation and the sanitizer says nothing; measured,
+		 * and written down in the README.
+		 */
+		uint32_t mem[SK_MEMINFO_VARS - 1] = { 0 };
+
+		off = inet_rec(AF_INET, TCP_ESTABLISHED, 8080, 443,
+		    "127.0.0.1", "10.0.0.1", 0, 4268, 1001, 0);
+		attr(INET_DIAG_SKMEMINFO, mem, sizeof mem);
+		rec_end(off);
+		return 0;
+	}
+	if (!strcmp(c, "ext-cong-empty")) {
+		/* nla_put_string puts the terminator inside nla_len, so an
+		 * empty attribute is not an empty name. */
+		off = inet_rec(AF_INET, TCP_ESTABLISHED, 8080, 443,
+		    "127.0.0.1", "10.0.0.1", 0, 4264, 1001, 0);
+		attr(INET_DIAG_CONG, NULL, 0);
+		rec_end(off);
+		done();
+		return 0;
+	}
+	if (!strcmp(c, "ext-cong-long")) {
+		char long_name[40];
+
+		memset(long_name, 'c', sizeof long_name);
+		off = inet_rec(AF_INET, TCP_ESTABLISHED, 8080, 443,
+		    "127.0.0.1", "10.0.0.1", 0, 4265, 1001, 0);
+		attr(INET_DIAG_CONG, long_name, sizeof long_name);
+		rec_end(off);
+		done();
+		return 0;
+	}
+	if (!strcmp(c, "ext-unix-rqlen")) {
+		struct unix_diag_rqlen q = { 77, 88 };
+
+		off = unix_rec(SOCK_STREAM, TCP_LISTEN, 4266, 0, 1001,
+		    "/run/probe.sock", 16);
+		attr(UNIX_DIAG_RQLEN, &q, sizeof q);
+		rec_end(off);
+		done();
+		return 0;
+	}
+	if (!strcmp(c, "ext-unix-rqlen-short")) {
+		uint32_t half = 77;
+
+		off = unix_rec(SOCK_STREAM, TCP_LISTEN, 4267, 0, 1001,
+		    "/run/probe.sock", 16);
+		attr(UNIX_DIAG_RQLEN, &half, sizeof half);
+		rec_end(off);
+		done();
+		return 0;
+	}
 
 	/* --- well formed: one row per rendering rule ------------------- */
 	if (!strcmp(c, "v4")) {
@@ -571,6 +704,34 @@ static unsigned long ino_of(int fd)
 	return (unsigned long)st.st_ino;
 }
 
+/*
+ * The known-value oracle for the columns -m and -o add, and it is a different
+ * interface rather than a second opinion: SK_MEMINFO_RCVBUF and
+ * SK_MEMINFO_SNDBUF are sk_rcvbuf and sk_sndbuf, which is the same pair of
+ * fields getsockopt(SO_RCVBUF) and getsockopt(SO_SNDBUF) read. So sockv's
+ * rb and tb, which arrived over netlink as an optional attribute, must equal
+ * two numbers obtained here through a syscall that touches no netlink at all.
+ *
+ * BACKLOG is stronger still, because the number is one this program chose:
+ * idiag_wqueue and udiag_wqueue hold sk_max_ack_backlog for a listening
+ * socket, which is the argument passed to listen(2).
+ */
+static void ext_expect(const char *tag, int fd)
+{
+	int rb = 0, tb = 0;
+	socklen_t n = sizeof rb;
+
+	if (getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rb, &n) < 0) return;
+	n = sizeof tb;
+	if (getsockopt(fd, SOL_SOCKET, SO_SNDBUF, &tb, &n) < 0) return;
+	printf("EXT %s %lu %d %d\n", tag, ino_of(fd), rb, tb);
+}
+
+static void backlog_expect(const char *tag, int fd, int backlog)
+{
+	printf("BACKLOG %s %lu %d\n", tag, ino_of(fd), backlog);
+}
+
 static int v4addr(struct sockaddr_in *a, int port)
 {
 	memset(a, 0, sizeof *a);
@@ -726,6 +887,8 @@ static int hold(int base, const char *dir, int secs)
 		snprintf(loc, sizeof loc, "127.0.0.1:%d", base);
 		expect("tcp4-listen", "inet", "tcp", "LISTEN", loc,
 		    "0.0.0.0:*", ino_of(l4));
+		ext_expect("tcp4-listen", l4);
+		backlog_expect("tcp4-listen", l4, 8);
 
 		v4addr(&a4, base);
 		c4 = socket(AF_INET, SOCK_STREAM, 0);
@@ -740,6 +903,54 @@ static int hold(int base, const char *dir, int secs)
 			    peer, ino_of(c4));
 			expect("tcp4-server", "inet", "tcp", "ESTAB", peer,
 			    loc, ino_of(s4));
+			ext_expect("tcp4-client", c4);
+			/*
+			 * The only timer this program can arm without a
+			 * privilege or a peer that stops answering, and the
+			 * reason the suite can require the timer column to be
+			 * something other than a field of zeroes. TCP_KEEPIDLE
+			 * before SO_KEEPALIVE, because enabling keepalive is
+			 * what arms sk_timer and it reads the idle value as it
+			 * stands then. Ten minutes, so the timer cannot fire
+			 * and re-arm at tcp_keepalive_intvl while the suite is
+			 * reading: idiag_expires must then be within the hold
+			 * window below KEEPIDLE_MS and above zero.
+			 */
+			{
+				int on = 1, idle = 600, brief = 9;
+
+				if (setsockopt(c4, IPPROTO_TCP, TCP_KEEPIDLE,
+				        &idle, sizeof idle) == 0 &&
+				    setsockopt(c4, SOL_SOCKET, SO_KEEPALIVE,
+				        &on, sizeof on) == 0)
+					printf("KEEP tcp4-client %lu %d\n",
+					    ino_of(c4), idle * 1000);
+				else
+					skip("tcp4-client keepalive timer",
+					    "setsockopt");
+				/*
+				 * And the accepted end with nine seconds
+				 * instead of ten minutes, for a different
+				 * assertion: ss renders an expiry under ten
+				 * seconds to the millisecond and anything
+				 * longer to the second or the minute, so this
+				 * is the socket whose remaining time can be
+				 * bracketed between two ss readings. It does
+				 * fire and re-arm every nine seconds, which
+				 * costs a keepalive probe to 127.0.0.1 and
+				 * is why it is not the socket used for the
+				 * known-value bound above.
+				 */
+				if (setsockopt(s4, IPPROTO_TCP, TCP_KEEPIDLE,
+				        &brief, sizeof brief) == 0 &&
+				    setsockopt(s4, SOL_SOCKET, SO_KEEPALIVE,
+				        &on, sizeof on) == 0)
+					printf("KEEP tcp4-server %lu %d\n",
+					    ino_of(s4), brief * 1000);
+				else
+					skip("tcp4-server keepalive timer",
+					    "setsockopt");
+			}
 		} else {
 			skip("tcp4-client", "connect/accept");
 			skip("tcp4-server", "connect/accept");
@@ -791,6 +1002,7 @@ static int hold(int base, const char *dir, int secs)
 	u4 = bind_v4("udp4-bound", SOCK_DGRAM, base + 2, 0);
 	if (u4 >= 0) {
 		snprintf(loc, sizeof loc, "127.0.0.1:%d", base + 2);
+		ext_expect("udp4-bound", u4);
 		expect("udp4-bound", "inet", "udp", "UNCONN", loc,
 		    "0.0.0.0:*", ino_of(u4));
 	}
@@ -911,6 +1123,8 @@ static int hold(int base, const char *dir, int secs)
 		snprintf(loc, sizeof loc, "%s:%lu", abs1, i);
 		expect("unix-abstract-listen", "unix", "u_str", "LISTEN", loc,
 		    "*:0", i);
+		ext_expect("unix-abstract-listen", ua);
+		backlog_expect("unix-abstract-listen", ua, 8);
 	}
 
 	ud = bind_unix("unix-dgram", SOCK_DGRAM, path2, 0);
@@ -937,6 +1151,7 @@ static int hold(int base, const char *dir, int secs)
 		snprintf(peer, sizeof peer, "*:%lu", i1);
 		expect("unix-socketpair-a", "unix", "u_str", "ESTAB", loc,
 		    peer, i0);
+		ext_expect("unix-socketpair-a", sp[0]);
 		expect("unix-socketpair-b", "unix", "u_str", "ESTAB", peer,
 		    loc, i1);
 	} else {

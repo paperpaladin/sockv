@@ -2,8 +2,8 @@
 
 ## Contract
 
-`sockv [-tux] [-l | -a] [--port N] [--addr A[/LEN]] [--dev NAME] [--records]`,
-and `sockv --parse PROTO FILE`.
+`sockv [-tux] [-l | -a] [-omi] [--port N] [--addr A[/LEN]] [--dev NAME]
+[--records]`, and `sockv --parse PROTO FILE`.
 
 List the kernel's TCP, UDP and UNIX domain sockets by asking the kernel over
 `NETLINK_SOCK_DIAG`, with `inet_diag_req_v2` for TCP and UDP and
@@ -32,9 +32,26 @@ never sent. They AND together and they test the local end. `unix_diag` has no
 bytecode, so `-x` alongside one of them is a usage error rather than an
 unfiltered answer, and a filter with no family flag defaults to `-t -u`.
 `--records` prints to stderr how many `SOCK_DIAG_BY_FAMILY` records the
-kernel sent; it is part of the interface because it is the only thing that
-distinguishes a filter the kernel ran from a filter run here after the fact,
-and the suite asserts on it.
+kernel sent, and how many of them carried each optional attribute; it is part
+of the interface because it is the only thing that distinguishes a filter the
+kernel ran from a filter run here after the fact, and an attribute the kernel
+answered from one it declined, and the suite asserts on both.
+
+`-o`, `-m` and `-i` append columns, in that order, after the uid. `-o` adds
+the queue lengths and `timer:(NAME,MSms,RETRANS)`, all of which are fields of
+`inet_diag_msg` except the UNIX queue pair, which comes from
+`UNIX_DIAG_RQLEN`. `-m` adds `skmem:(...)` from `INET_DIAG_SKMEMINFO` or
+`UNIX_DIAG_MEMINFO`, the nine `SK_MEMINFO_VARS` counters in `ss -m`'s own
+format. `-i` adds `cong:NAME` from `INET_DIAG_CONG`. The flags are named
+after the `ss` flags that print the same thing.
+
+`-m` and `-i` are requested through `idiag_ext`, a bitmask of
+(extension - 1), and through `udiag_show`, and the kernel answers or does
+not: a UDP socket has no congestion control, a TIME-WAIT entry has no
+`struct sock` and so no memory accounting. An attribute that did not arrive
+prints as `-` and never as a zero, because a zero is a value the kernel
+reported. The timer expiry is a raw millisecond count rather than `ss`'s
+rendering of it, which drops the milliseconds above nine seconds.
 
 `-t`, `-u` and `-x` select families and combine. With none given, all three
 are listed. `-l` is listening only, which means `TCP_LISTEN` for TCP, stream
@@ -82,6 +99,13 @@ If any of those three fails, the program is worthless. A socket enumerator
 that silently drops sockets is worse than no enumerator, and a netlink parser
 that reads out of bounds is a vulnerability in anything that uses it.
 
+The optional attributes `-m` and `-i` request are a qualification on the
+first half rather than an exception to it. The kernel chooses whether to
+answer, so "every field as the kernel gave it" includes the case where it
+gave nothing, and that case prints as `-` and is counted rather than being
+rendered as a zero. A column of zeroes that agrees with `ss` over sockets
+that have no value to report is the failure mode the counts exist to catch.
+
 ## Oracle
 
 Ranked by how little of each is ours.
@@ -105,6 +129,33 @@ Ranked by how little of each is ours.
 
    `ss -e` reports no uid for UNIX sockets, so the UNIX differentials compare
    five fields and the suite prints a `skip` line saying so.
+
+   Six further differentials compare one extension column at a time, which
+   is what makes `ss` a per-FIELD oracle here and not a per-socket one:
+   `ss -o` for the timer, `ss -m` for the memory counters, `ss -i` for the
+   congestion control name, and the Recv-Q/Send-Q pair `ss` prints by
+   default, for inet and for UNIX. Each projects both programs down to a
+   socket key plus one column, so a disagreement names the column.
+
+   These values move, and three different things handle that. The live
+   comparison reuses the sandwich: only sockets whose projected row is
+   identical in both `ss` runs are required to be in sockv's output, so one
+   whose counter moved drops out of the claim rather than failing it, and the
+   count floor beside it is what stops that from becoming a silent
+   narrowing. Exact per-field values come from the probe's own quiet sockets,
+   where `skmem`'s `rb` and `tb` must equal `getsockopt(SO_RCVBUF)` and
+   `getsockopt(SO_SNDBUF)` and a listener's Send-Q must equal the backlog the
+   probe passed to `listen(2)`: a different interface, and in the second case
+   a number the suite chose. The expiry gets a bound instead of an equality,
+   against a `TCP_KEEPIDLE` the probe set and between two `ss` readings taken
+   either side of sockv's.
+
+   And the counts, because a column of agreeing absences is indistinguishable
+   from a column of agreeing values in a diff. `--records` reports arrivals
+   per attribute, the suite requires each to be non-zero and requires the
+   count to equal the number of rows showing that attribute from the same
+   invocation. That is the record-count shape the bytecode filters are judged
+   by, applied to the question an output comparison cannot answer.
 
 2. Sockets the suite creates. `t/probe hold` binds and connects twenty
    sockets whose family, type, state and address it chose, takes each inode
@@ -145,13 +196,23 @@ Ranked by how little of each is ours.
    is reported by sockv and absent from `/proc/net/tcp`, and that asymmetry is
    a passing assertion whose expectation is that something is missing.
 
-5. `make mutants`. Not an oracle for the program but for the suite: 35
+5. `make mutants`. Not an oracle for the program but for the suite: 53
    planted defects, each built and run through the whole suite, with the
    verdict asserted, including for the two documented survivors, so a
    ceiling that disappears fails the script instead of becoming folklore. It
-   has already earned its place twice, by showing that a mutant called
-   provably equivalent was not, and by exposing the `--parse` fixture buffer
-   that made `make test-asan` unable to fail.
+   has already earned its place three times, by showing that a mutant called
+   provably equivalent was not, by exposing the `--parse` fixture buffer that
+   made `make test-asan` unable to fail, and by `--check` finding a pattern
+   that had stopped matching and two that had always matched more than they
+   read.
+
+   `t/mutants.sh --check` is the cheap half: it applies every pattern and
+   requires each to change exactly one line, without building anything.
+   `make test` runs it, and the Makefile is where it has to live, because a
+   check that reads `sockv.c` cannot run from inside a harness a sweep uses
+   to judge mutations of `sockv.c`. Run from `t/run.sh` it would fail during
+   every mutant for that reason alone and every mutation would score as
+   killed.
 
 ## Non-goals
 
@@ -161,9 +222,14 @@ Ranked by how little of each is ours.
   inode. That is not a netlink feature, it cannot be done unprivileged for
   other users' sockets, and bolting it on would turn a netlink client into a
   `/proc` crawler. The uid column is what is offered instead.
-- Being `ss`. No `-s` summary, no `-i` TCP info, no `-m` memory, no `-o`
-  timers, no `-r` name resolution, no `-N` namespace entry, no interactive
-  filter expression language.
+- Being `ss`. No `-s` summary, no `-r` name resolution, no `-N` namespace
+  entry, no interactive filter expression language. `-o`, `-m` and `-i` exist
+  and are narrower than `ss`'s: `-i` is the congestion control name and not
+  `tcp_info`, so none of `cwnd`, `rtt`, `wscale` or the byte counters is
+  printed, and `INET_DIAG_INFO` is not requested at all. The line this
+  non-goal used to draw was at the wrong place: those three columns are the
+  only part of `ss`'s default and near-default output the differential could
+  not reach, which made them worth having rather than mimicry.
 - Writing. `sock_diag` can also destroy a socket. This program reads.
 - Root. Everything here runs unprivileged, like `jail`. Anything needing
   privilege is skipped loudly and listed in the README.
@@ -177,7 +243,7 @@ Ranked by how little of each is ours.
 
 ## Commit sequence
 
-Twelve steps so far, in twenty-three commits once the fixes and the
+Thirteen steps so far, in twenty-four commits once the fixes and the
 documentation passes between them are counted. Every one builds, and every
 one from the second onwards went through `cq c`, so the suite ran against the
 working tree before the commit existed.
@@ -286,12 +352,64 @@ working tree before the commit existed.
       Pinned a surprise while writing it: a prefix length of zero still
       selects by family, so `--addr 0.0.0.0/0` lists the IPv4 sockets and
       `--addr ::/0` the IPv6 ones. `ss` agrees, so it is the kernel's rule.
-- [ ] `idiag_ext` and the queue, timer and retransmit columns, so `ss -o` and
+- [x] `idiag_ext` and the queue, timer and retransmit columns, so `ss -o` and
       the Recv-Q/Send-Q pair become comparable.
       why: two columns of `ss`'s default output are currently not compared by
       the differential at all, a hole in an oracle that otherwise
       compares every field. Queue lengths are already in `inet_diag_msg` and
       cost nothing to print.
+      done: `-o`, `-m` and `-i`, named after the `ss` flags that print the
+      same thing. `-o` is the queue pair and `timer:(NAME,MSms,RETRANS)`,
+      which needs nothing from `idiag_ext` on the inet side because those are
+      fields of `inet_diag_msg`; the UNIX queue pair comes from
+      `UNIX_DIAG_RQLEN`. `-m` is the nine `SK_MEMINFO_VARS` counters from
+      `INET_DIAG_SKMEMINFO` or `UNIX_DIAG_MEMINFO`, `-i` the congestion
+      control name from `INET_DIAG_CONG`. `INET_DIAG_INFO` is not requested
+      and `tcp_info` is not rendered, so `-i` is one token of a line `ss`
+      fills with forty, and that is in the README.
+      The interesting part was not the columns. `idiag_ext` is a request and
+      the kernel decides, so an absent attribute is a third outcome beside
+      agreement and disagreement, and the only honest way to know which
+      arrived is to count them. Measured on this kernel: `INET_DIAG_CONG`
+      and `INET_DIAG_SKMEMINFO` for 26 of 62 TCP records, the 36 that
+      declined being every TIME-WAIT socket, which has no `struct sock` to
+      account for and already reports inode 0 for the same reason;
+      `INET_DIAG_CONG` for 0 of 22 UDP sockets, every time, because a UDP
+      socket has no congestion control; `UNIX_DIAG_RQLEN` and
+      `UNIX_DIAG_MEMINFO` for all 1577 UNIX records; and nothing at all with
+      no flag given, which is the control. Two timer kinds occur live,
+      keepalive and timewait; `on`, `persist`, an unknown timer number and a
+      nonzero retransmit count are reachable only by fixture.
+      Six per-column differentials, which makes `ss` a per-field oracle
+      rather than a per-socket one. The moving values are handled three
+      ways: the sandwich for the live comparison, the probe's quiet sockets
+      for exact values (`rb` and `tb` against `getsockopt(SO_RCVBUF)` and
+      `SO_SNDBUF`, Send-Q against the backlog the probe passed `listen`), and
+      a bound rather than an equality for the expiry, which is a countdown.
+      The probe arms a keepalive timer rather than hoping the machine has
+      one, because a timer column over sockets with no timer running is a
+      column of zeroes that agrees perfectly and would agree just as well if
+      the field were never read.
+      Three defects, all in the harness. The `ss`-side parser assigned to
+      `$0` inside a function and then read `$0` after it returned, so every
+      row was emitted again on the next line and `ss` appeared to report one
+      socket fifty times. `eq()` read its arguments after `shift 3`, so its
+      FAILURE branch died under `set -u` with no summary line, which the
+      mutation sweep scores as an unknown count rather than as a catch:
+      found by planting a mutant, and it is the shape METHOD records from
+      `sha2`, a red path that cannot run. And the `ss` shutdown marker is
+      not always `<->`, it is `-->` for a socket whose peer has sent FIN, so
+      anchoring the congestion-control token on the literal string found no
+      name for the one CLOSE-WAIT socket on the machine.
+      17 new mutants, all caught, and the sweep reported 0 survivors beyond
+      the two documented. `t/mutants.sh --check` is new and found a pattern
+      that had silently stopped matching (`row()` grew an argument) plus two
+      that matched more than one line, one of them two real call sites.
+      Four planted reads measured under ASan, UBSan and valgrind, and the
+      table is in the README: whether a deleted length check is visible
+      turned out to depend on whether the fixture puts a `NLMSG_DONE` record
+      after the attribute or ends the reply there, so `t/probe` builds both.
+      139 assertions became 187, and 35 mutants became 53.
 - [ ] `netlink_diag`, so `sockv -N` lists netlink sockets.
       why: the one remaining family that needs no new concepts: a third
       request struct alongside the two already here, and the one `ss -f

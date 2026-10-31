@@ -124,10 +124,10 @@ static const char *state_name(unsigned s)
 
 static void row(const char *fam, const char *netid, const char *state,
                 const char *local, const char *peer,
-                uint32_t inode, uint32_t uid)
+                uint32_t inode, uint32_t uid, const char *ext)
 {
-	printf("%-5s %-5s %-10s %-28s %-28s %8u %6u\n",
-	    fam, netid, state, local, peer, inode, uid);
+	printf("%-5s %-5s %-10s %-28s %-28s %8u %6u%s\n",
+	    fam, netid, state, local, peer, inode, uid, ext);
 }
 
 /*
@@ -274,6 +274,209 @@ static int attr_u32(const struct attrs *at, unsigned t, uint32_t *v)
 	return 0;
 }
 
+/* ------------------------------------------------- optional extensions */
+
+/*
+ * -o, -m and -i add columns, and they are named after ss's flags because ss
+ * is the oracle for every column they add: `ss -o` for the timer, `ss -m`
+ * for the memory counters, `ss -i` for the congestion control name. Spelling
+ * the request the same way on both sides keeps the differential a comparison.
+ *
+ * The three are not the same kind of thing, and the difference is the point
+ * of this whole group. idiag_rqueue, idiag_wqueue, idiag_timer,
+ * idiag_retrans and idiag_expires are fields of inet_diag_msg and arrive
+ * whether or not anybody asked. INET_DIAG_SKMEMINFO and INET_DIAG_CONG are
+ * requested through idiag_ext, which is a bitmask of (extension - 1) in
+ * eight bits, and the kernel answers or does not: a UDP socket has no
+ * congestion control to report and sends nothing rather than sending a
+ * placeholder. So an optional attribute has three outcomes and not two.
+ * It arrived and agrees, it arrived and disagrees, or it never came, and the
+ * third is not a disagreement with anything. An absent attribute prints as
+ * "-" rather than as a zero, and the counters below say how many sockets
+ * carried each one, because a column of "-" and a column of agreeing values
+ * look identical in a diff. See METHOD.md, "assert that the new path ran".
+ */
+static int want_o, want_m, want_i;
+static uint8_t ext_mask;
+
+static unsigned long seen_skmem;     /* INET_DIAG_SKMEMINFO or UNIX_DIAG_MEMINFO */
+static unsigned long seen_cong;      /* INET_DIAG_CONG */
+static unsigned long seen_rqlen;     /* UNIX_DIAG_RQLEN */
+static unsigned long seen_timer;     /* idiag_timer was not "off" */
+
+/*
+ * ss's names for idiag_timer. 1 is a retransmit timer, which ss calls "on",
+ * 2 is keepalive, 3 is the TIME-WAIT timer, 4 is the zero-window probe.
+ * Only "keepalive" and "timewait" occur on this machine: the suite arms a
+ * keepalive timer on a socket it owns so the column is not a field of
+ * zeroes, and reports what it measured for the other three.
+ */
+static const char *const TIMER[] = {
+	"off", "on", "keepalive", "timewait", "persist"
+};
+#define NTIMER ((unsigned)(sizeof TIMER / sizeof *TIMER))
+
+/* The nine SK_MEMINFO_VARS counters with ss's own one and two letter labels,
+ * in ss's order, because `ss -m` prints exactly this string. */
+static const char *const SKMEM[] = {
+	"r", "rb", "t", "tb", "f", "w", "o", "bl", "d"
+};
+
+/*
+ * snprintf returns the length it WOULD have written, so a running offset
+ * advanced by its return value walks past the end of the buffer the first
+ * time anything truncates. This clamps instead.
+ */
+static void app(char *out, size_t cap, size_t *n, const char *fmt, ...)
+{
+	va_list ap;
+	int k;
+
+	if (*n + 1 >= cap) return;
+	va_start(ap, fmt);
+	k = vsnprintf(out + *n, cap - *n, fmt, ap);
+	va_end(ap);
+	if (k < 0) return;
+	if ((size_t)k >= cap - *n) *n = cap - 1;
+	else *n += (size_t)k;
+}
+
+/*
+ * The nine memory counters, from INET_DIAG_SKMEMINFO on an inet socket and
+ * from UNIX_DIAG_MEMINFO on a UNIX one. Same array, same nine labels, same
+ * rendering: ss prints the identical string for both, so one function does
+ * both and one comparison covers both.
+ *
+ * A shorter attribute than the array it claims to be is a reply lying about
+ * its own length and is refused like every other such case here. A LONGER
+ * one is a newer kernel with more counters, and is read to the width this
+ * build knows: the same reason an unknown attribute type is ignored.
+ */
+static int fmt_skmem(char *out, size_t cap, size_t *n,
+                     const struct attrs *at, unsigned type)
+{
+	uint32_t v[SK_MEMINFO_VARS];
+	size_t i;
+
+	if (!at->val[type]) {
+		app(out, cap, n, " skmem:-");
+		return 0;
+	}
+	if (at->len[type] < sizeof v)
+		return refuse("attribute %u carries %u bytes; the %zu "
+		    "SK_MEMINFO_VARS counters need %zu", type, at->len[type],
+		    (size_t)SK_MEMINFO_VARS, sizeof v);
+	memcpy(v, at->val[type], sizeof v);
+	seen_skmem++;
+	app(out, cap, n, " skmem:(");
+	for (i = 0; i < SK_MEMINFO_VARS; i++)
+		app(out, cap, n, "%s%s%u", i ? "," : "", SKMEM[i], v[i]);
+	app(out, cap, n, ")");
+	return 0;
+}
+
+/*
+ * INET_DIAG_CONG is the congestion control module's name, and the kernel
+ * sends it with nla_put_string, so the terminator is inside nla_len. A
+ * zero-length attribute is therefore not an empty name but an attribute with
+ * no room for one, and is refused. So is a name too long for the buffer:
+ * TCP_CA_NAME_MAX is 16 and this holds twice that, and an unknown LENGTH is
+ * refused here even though an unknown TYPE is ignored.
+ */
+static int fmt_cong(char *out, size_t cap, size_t *n, const struct attrs *at)
+{
+	char name[32];
+	size_t len;
+
+	if (!at->val[INET_DIAG_CONG]) {
+		app(out, cap, n, " cong:-");
+		return 0;
+	}
+	len = at->len[INET_DIAG_CONG];
+	if (!len)
+		return refuse("attribute %u is empty; a congestion control "
+		    "name needs at least its terminator", INET_DIAG_CONG);
+	if (len > sizeof name - 1)
+		return refuse("attribute %u carries %zu bytes; a congestion "
+		    "control name holds at most %zu", INET_DIAG_CONG, len,
+		    sizeof name - 1);
+	memcpy(name, at->val[INET_DIAG_CONG], len);
+	name[len] = '\0';
+	seen_cong++;
+	app(out, cap, n, " cong:%s", name);
+	return 0;
+}
+
+/*
+ * Why the timer is printed as raw milliseconds and not the way ss prints it.
+ * ss renders idiag_expires through a formatter that drops the milliseconds
+ * above nine seconds and the seconds above nine minutes, so "11sec" is any
+ * value in a one-second range, and the number is a countdown that the two
+ * programs necessarily read at two different instants. There is no
+ * byte-for-byte comparison to be had, so the raw count the kernel gave is
+ * what goes out, and the suite brackets it between two ss readings instead
+ * of equating it to one. The timer NAME and the retransmit count do not
+ * move, and those are compared exactly.
+ */
+static int ext_inet(char *out, size_t cap, const struct inet_diag_msg *m,
+                    const struct attrs *at)
+{
+	size_t n = 0;
+
+	out[0] = '\0';
+	if (want_o) {
+		unsigned tm = m->idiag_timer;
+
+		if (tm) seen_timer++;
+		app(out, cap, &n, " %u %u timer:(%s,%ums,%u)",
+		    m->idiag_rqueue, m->idiag_wqueue,
+		    tm < NTIMER ? TIMER[tm] : "unknown",
+		    m->idiag_expires, m->idiag_retrans);
+	}
+	if (want_m && fmt_skmem(out, cap, &n, at, INET_DIAG_SKMEMINFO) < 0)
+		return -1;
+	if (want_i && fmt_cong(out, cap, &n, at) < 0) return -1;
+	return 0;
+}
+
+/*
+ * The UNIX side of the same three flags. unix_diag has no timer and no
+ * congestion control, so those two columns are "-": not an attribute the
+ * kernel declined to send, but a field the interface does not have, and
+ * `ss -xo` and `ss -xi` print nothing there either.
+ *
+ * The queue pair is an opt-in attribute here rather than a field of the
+ * message, which is the one asymmetry with inet worth knowing: UNIX_DIAG_RQLEN
+ * has to be asked for through udiag_show. Its absence prints as 0 0 and not
+ * as "-", because that is what ss prints when it did not get the attribute,
+ * and the arrival count below is what distinguishes the two.
+ */
+static int ext_unix(char *out, size_t cap, const struct attrs *at)
+{
+	size_t n = 0;
+
+	out[0] = '\0';
+	if (want_o) {
+		struct unix_diag_rqlen q = { 0, 0 };
+
+		if (at->val[UNIX_DIAG_RQLEN]) {
+			if (at->len[UNIX_DIAG_RQLEN] < sizeof q)
+				return refuse("attribute %u carries %u bytes, "
+				    "unix_diag_rqlen needs %zu",
+				    UNIX_DIAG_RQLEN, at->len[UNIX_DIAG_RQLEN],
+				    sizeof q);
+			memcpy(&q, at->val[UNIX_DIAG_RQLEN], sizeof q);
+			seen_rqlen++;
+		}
+		app(out, cap, &n, " %u %u timer:-",
+		    q.udiag_rqueue, q.udiag_wqueue);
+	}
+	if (want_m && fmt_skmem(out, cap, &n, at, UNIX_DIAG_MEMINFO) < 0)
+		return -1;
+	if (want_i) app(out, cap, &n, " cong:-");
+	return 0;
+}
+
 /* ------------------------------------------------------------- the messages */
 
 /*
@@ -289,7 +492,7 @@ static int show_inet(const unsigned char *rec, size_t reclen, const char *netid)
 	struct attrs at;
 	size_t payload, off;
 	uint8_t v6only = 0;
-	char local[160], peer[160];
+	char local[160], peer[160], ext[256];
 	const char *fam;
 
 	payload = reclen - NLMSG_HDRLEN;
@@ -314,8 +517,9 @@ static int show_inet(const unsigned char *rec, size_t reclen, const char *netid)
 	endpoint(peer, sizeof peer, m.idiag_family, m.id.idiag_dst,
 	    m.id.idiag_dport, 0, v6only);
 
+	if (ext_inet(ext, sizeof ext, &m, &at) < 0) return -1;
 	row(fam, netid, state_name(m.idiag_state), local, peer,
-	    m.idiag_inode, m.idiag_uid);
+	    m.idiag_inode, m.idiag_uid, ext);
 	return 0;
 }
 
@@ -356,7 +560,7 @@ static int show_unix(const unsigned char *rec, size_t reclen, const char *unused
 	struct attrs at;
 	size_t payload, off;
 	uint32_t peer = 0, uid = 0;
-	char name[160], local[192], peerbuf[32];
+	char name[160], local[192], peerbuf[32], ext[256];
 	const char *netid;
 
 	(void)unused;
@@ -415,8 +619,9 @@ static int show_unix(const unsigned char *rec, size_t reclen, const char *unused
 
 	snprintf(local, sizeof local, "%s:%u", name, m.udiag_ino);
 	snprintf(peerbuf, sizeof peerbuf, "*:%u", peer);
+	if (ext_unix(ext, sizeof ext, &at) < 0) return -1;
 	row("unix", netid, state_name(m.udiag_state), local, peerbuf,
-	    m.udiag_ino, uid);
+	    m.udiag_ino, uid, ext);
 	return 0;
 }
 
@@ -846,11 +1051,13 @@ static int dump_inet(struct dump *d, int family, int proto, uint32_t states,
 	req.r.sdiag_protocol = (uint8_t)proto;
 	req.r.idiag_states = states;
 	/*
-	 * idiag_ext stays zero: the base inet_diag_msg carries everything we
-	 * print. INET_DIAG_SKV6ONLY is not requestable anyway -- idiag_ext is
-	 * eight bits wide and that attribute is number 11 -- the kernel sends
-	 * it unasked for every AF_INET6 socket.
+	 * idiag_ext is a bitmask of (extension - 1), set by -m and -i and
+	 * zero without them. It is eight bits wide, so only the first eight
+	 * extensions can be asked for at all: INET_DIAG_SKV6ONLY is number 11
+	 * and is not requestable, and the kernel sends it unasked for every
+	 * AF_INET6 socket regardless.
 	 */
+	req.r.idiag_ext = ext_mask;
 	if (bclen) {
 		/* The offset is computed rather than assumed: an attribute
 		 * has to start on a four-byte boundary after the request
@@ -884,8 +1091,13 @@ static int dump_unix(struct dump *d, uint32_t states)
 	req.r.sdiag_family = AF_UNIX;
 	req.r.udiag_states = states;
 	/* Unlike inet_diag, unix_diag sends nothing it was not asked for: the
-	 * name, the peer's inode and the owning uid are all opt-in. */
+	 * name, the peer's inode and the owning uid are all opt-in, and so are
+	 * the queue lengths and the memory counters. udiag_show is a flag word
+	 * rather than inet_diag's shifted bitmask, so the two requests spell
+	 * the same idea differently. */
 	req.r.udiag_show = UDIAG_SHOW_NAME | UDIAG_SHOW_PEER | UDIAG_SHOW_UID;
+	if (want_o) req.r.udiag_show |= UDIAG_SHOW_RQLEN;
+	if (want_m) req.r.udiag_show |= UDIAG_SHOW_MEMINFO;
 	d->netid = NULL;
 	d->show = show_unix;
 	return run_dump(d, &req, sizeof req);
@@ -981,8 +1193,8 @@ static int parse_file(const char *proto, const char *path)
 static void usage(FILE *f)
 {
 	fprintf(f,
-	    "usage: %s [-tux] [-l | -a] [--port N] [--addr A[/LEN]] [--dev NAME]\n"
-	    "              [--records]\n"
+	    "usage: %s [-tux] [-l | -a] [-omi] [--port N] [--addr A[/LEN]]\n"
+	    "              [--dev NAME] [--records]\n"
 	    "       %s --parse PROTO FILE\n"
 	    "\n"
 	    "  -t       TCP sockets          -l   listening only\n"
@@ -990,6 +1202,17 @@ static void usage(FILE *f)
 	    "  -x       UNIX domain sockets\n"
 	    "\n"
 	    "With no family flag, all of -t -u -x are listed.\n"
+	    "\n"
+	    "Extra columns, appended in this order, named after the ss flags\n"
+	    "that print the same thing:\n"
+	    "\n"
+	    "  -o       queue lengths and the timer   (ss -o)\n"
+	    "  -m       the nine memory counters      (ss -m)\n"
+	    "  -i       congestion control name       (ss -i)\n"
+	    "\n"
+	    "-o comes out of the base message. -m and -i are requested through\n"
+	    "idiag_ext and udiag_show, and the kernel answers or does not: an\n"
+	    "attribute that never arrived prints as - rather than as a zero.\n"
 	    "\n"
 	    "Filters, compiled to INET_DIAG_REQ_BYTECODE and run BY THE KERNEL,\n"
 	    "so a socket that does not match is never sent. They combine with\n"
@@ -1003,7 +1226,9 @@ static void usage(FILE *f)
 	    "  --dev NAME           bound to interface NAME  (ss: dev == NAME)\n"
 	    "  --records            print to stderr how many records the\n"
 	    "                       kernel sent, which is what distinguishes a\n"
-	    "                       kernel-side filter from a userspace one\n"
+	    "                       kernel-side filter from a userspace one,\n"
+	    "                       and how many of them carried each optional\n"
+	    "                       attribute\n"
 	    "\n"
 	    "  --parse PROTO FILE   walk FILE as a captured netlink reply and\n"
 	    "                       list what it holds. PROTO is tcp, udp or\n"
@@ -1011,7 +1236,8 @@ static void usage(FILE *f)
 	    "                       so it can be fed bytes no kernel would send.\n"
 	    "\n"
 	    "One row per socket, no header:\n"
-	    "  FAMILY NETID STATE LOCAL PEER INODE UID\n"
+	    "  FAMILY NETID STATE LOCAL PEER INODE UID [RECVQ SENDQ TIMER]\n"
+	    "         [SKMEM] [CONG]\n"
 	    "Exit: 0 listed, 1 syscall or kernel error, 2 malformed reply,\n"
 	    "3 usage.\n",
 	    prog, prog);
@@ -1099,6 +1325,9 @@ int main(int argc, char **argv)
 				case 'x': want_x = explicit_x = 1; break;
 				case 'l': listening = 1; break;
 				case 'a': listening = 0; break;
+				case 'o': want_o = 1; break;
+				case 'm': want_m = 1; break;
+				case 'i': want_i = 1; break;
 				default:
 					fprintf(stderr,
 					    "%s: unknown option -%c\n", prog,
@@ -1134,6 +1363,17 @@ int main(int argc, char **argv)
 	}
 	bc_end();
 
+	/*
+	 * -o needs nothing from idiag_ext: every field it prints is in
+	 * inet_diag_msg already. -m and -i do, and the mask is the only thing
+	 * that decides whether those attributes come back, so a request built
+	 * without it produces a listing of "-" that looks exactly like a
+	 * kernel declining to answer. The suite tells those apart with the
+	 * arrival counts --records prints.
+	 */
+	if (want_m) ext_mask |= (uint8_t)(1U << (INET_DIAG_SKMEMINFO - 1));
+	if (want_i) ext_mask |= (uint8_t)(1U << (INET_DIAG_CONG - 1));
+
 	memset(&d, 0, sizeof d);
 	d.fd = nl_open();
 	if (d.fd < 0) return EX_FAIL;
@@ -1157,7 +1397,12 @@ int main(int argc, char **argv)
 	}
 
 	close(d.fd);
-	if (show_records) fprintf(stderr, "records: %lu\n", records);
+	if (show_records) {
+		fprintf(stderr, "records: %lu\n", records);
+		fprintf(stderr, "ext: skmem %lu, cong %lu, rqlen %lu, "
+		    "timer %lu\n", seen_skmem, seen_cong, seen_rqlen,
+		    seen_timer);
+	}
 	if (r == -1) return EX_BAD;
 	if (r < 0) return EX_FAIL;
 	return EX_OK;

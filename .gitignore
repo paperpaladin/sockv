@@ -4,8 +4,6 @@
 t/probe
 t/probe-san
 
-# test scratch
-t/tmp/
 
 # editor / tooling debris
 *.o

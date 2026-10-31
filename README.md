@@ -10,6 +10,10 @@ sockv -l          listening only
 sockv -a          every state (the default)
 sockv             all three families
 
+sockv -tu -o      and the queue lengths and the timer   (ss -o)
+sockv -tu -m      and the nine memory counters          (ss -m)
+sockv -t  -i      and the congestion control name       (ss -i)
+
 sockv -t --port 443             local port 443,   filtered by the kernel
 sockv -tu --addr 127.0.0.0/8    local address in 127/8
 sockv -tu --dev lo              bound to interface lo
@@ -29,7 +33,8 @@ unix  u_str ESTAB      /run/user/1000/bus:44078     *:33753                     
 unix  u_dgr UNCONN     @sockv-probe-47310:195741    *:0                            195741   1000
 ```
 
-`FAMILY NETID STATE LOCAL PEER INODE UID`. A UNIX socket's local end is
+`FAMILY NETID STATE LOCAL PEER INODE UID`, and `-o`, `-m` and `-i` append
+further columns after the uid in that order. A UNIX socket's local end is
 `name:inode` and its peer end is `*:peer-inode`, because `ss` reports a UNIX
 socket's inode in the column it labels Port, so both kinds of row have the
 same `address:port` shape and one comparison covers both.
@@ -83,14 +88,186 @@ Three details that are not obvious:
   so this is the kernel's rule and not a misreading of it, and both cases are
   in the suite.
 
+## The optional extensions
+
+`-o`, `-m` and `-i` are named after the `ss` flags that print the same thing,
+because `ss` is the oracle for every column they add and a differential is
+easier to read when both sides spell the request the same way.
+
+```
+$ sockv -t -omi
+inet  tcp   LISTEN     127.0.0.1:631                0.0.0.0:*                       18528  65534 0 4096 timer:(off,0ms,0) skmem:(r0,rb131072,t0,tb16384,f0,w0,o0,bl0,d0) cong:cubic
+inet  tcp   ESTAB      127.0.0.1:47386              127.0.0.1:47901              28170985   1000 0 0 timer:(keepalive,598464ms,0) skmem:(r0,rb131072,t0,tb2626560,f0,w0,o0,bl0,d0) cong:cubic
+inet  tcp   TIME-WAIT  192.168.122.10:51982         172.64.155.209:443                  0      0 0 0 timer:(timewait,24001ms,0) skmem:- cong:-
+```
+
+The third row is the one worth looking at. A TIME-WAIT entry reports inode 0
+and uid 0 because it has no owning socket left to ask, and for the same
+reason the kernel sends no memory counters and no congestion control name
+for it at all.
+
+The three are not the same kind of thing, and the difference is the point of
+the group. `idiag_rqueue`, `idiag_wqueue`, `idiag_timer`, `idiag_retrans` and
+`idiag_expires` are fields of `inet_diag_msg` and arrive whether or not
+anybody asks, so `-o` needs nothing from the kernel it was not already
+getting. `INET_DIAG_SKMEMINFO` and `INET_DIAG_CONG` have to be requested
+through `idiag_ext`, which is a bitmask of (extension - 1) in eight bits, and
+the kernel then answers or does not. On the UNIX side the same two columns
+come from `UNIX_DIAG_RQLEN` and `UNIX_DIAG_MEMINFO`, requested through
+`udiag_show`, which is a flag word rather than a shifted mask: the same idea
+spelled differently in a different request struct, so it gets its own
+assertions rather than being assumed to follow.
+
+An optional attribute therefore has three outcomes, and keeping them apart is
+most of the work here:
+
+- It arrived and the value agrees with `ss`. That is the differential.
+- It arrived and the value disagrees. That is a failure.
+- It never arrived, which is not a disagreement with anything. It prints as
+  `-`, never as a zero, and is counted.
+
+A zero is a value the kernel reported. A `-` is the kernel not reporting one.
+The two look identical in a diff, which is why the counts below exist.
+
+### What this kernel actually returned
+
+`--records` prints the arrival count per attribute, measured in one run on
+7.2.13-200.fc44.x86_64:
+
+```
+$ sockv -t -omi --records >/dev/null
+records: 62
+ext: skmem 26, cong 26, rqlen 0, timer 51
+
+$ sockv -u -omi --records >/dev/null
+records: 22
+ext: skmem 22, cong 0, rqlen 0, timer 0
+
+$ sockv -x -omi --records >/dev/null
+records: 1577
+ext: skmem 1577, cong 0, rqlen 1577, timer 0
+
+$ sockv -tux --records >/dev/null
+records: 1661
+ext: skmem 0, cong 0, rqlen 0, timer 0
+```
+
+Four facts in those numbers, each of them a passing assertion:
+
+`INET_DIAG_SKMEMINFO` and `INET_DIAG_CONG` came back for 26 of 62 TCP
+records. The 36 that declined are every TIME-WAIT socket on the machine, and
+that is coherent rather than a gap: a timewait entry has no full `struct
+sock` behind it, so there is no memory accounting and no congestion control
+module to report, which is the same reason it already reports inode 0 and
+uid 0. The suite asserts that every inet record which declined is in a state
+with no full socket behind it, and prints the states it found.
+
+The kernel declines `INET_DIAG_CONG` for all 22 UDP sockets, every time. A
+UDP socket has no congestion control. `ss -ui` prints nothing there either,
+so this is agreement and not a hole, but only the count says the column was
+empty for that reason rather than because the request never went out.
+
+`UNIX_DIAG_RQLEN` and `UNIX_DIAG_MEMINFO` came back for all 1577 UNIX
+records.
+
+With no extension flag, `idiag_ext` is zero and nothing optional arrives at
+all. That is the control that makes the other three mean something.
+`INET_DIAG_SKV6ONLY` does arrive unrequested on every `AF_INET6` socket, so
+"this kernel sends nothing it was not asked for" is not the claim being
+made; the claim is about these four.
+
+Two timer kinds occur live: `keepalive` on 15 sockets and `timewait` on 36.
+`on` (a retransmit timer) and `persist` (a zero-window probe) do not occur
+here, and neither does a nonzero retransmit count, because provoking either
+needs a peer that stops answering. Both are reached by a `--parse` fixture
+instead, along with a timer number past the end of the table.
+
+### These values move
+
+A queue length and a memory counter change with traffic, and a timer's
+remaining time changes every millisecond, so two readings a second apart are
+two different states and not a disagreement. Three separate mechanisms handle
+that, and they are deliberately different:
+
+The live comparison uses the sandwich the rest of the suite already uses.
+`ss` runs, then sockv, then `ss` again, and only sockets whose projected row
+is identical in **both** `ss` runs are required to appear in sockv's output.
+A socket whose counter moved during the window drops out of the claim rather
+than failing it. The count assertion beside each comparison is what stops
+that from becoming a silent narrowing: if the volatile columns emptied the
+stable set, the number falls below its floor and the assertion fails. In
+practice the narrowing is small. In the run below all four inet projections
+compared the same 60 sockets, the six-field one included. Where the numbers
+do differ between one differential and the next it is mostly not the columns
+at all but the TIME-WAIT population turning over between one sandwich and
+the next, since each differential takes its own.
+
+Exact per-field values come from the sockets the suite creates. Nothing is
+sent on them, so their counters do not move at all, and the numbers they
+must show come from somewhere other than netlink: `skmem`'s `rb` and `tb`
+are `sk_rcvbuf` and `sk_sndbuf`, which is the same pair of fields
+`getsockopt(SO_RCVBUF)` and `getsockopt(SO_SNDBUF)` read, so the probe
+compares a value that arrived as an optional netlink attribute against one
+fetched through a syscall that touches no netlink. `Send-Q` on a listening
+socket is `sk_max_ack_backlog`, which is the number the probe passed to
+`listen(2)`, so that one is not a second reading of a kernel value at all.
+
+The expiry gets a bound rather than an equality, and the probe arms the timer
+rather than hoping the machine has one: `SO_KEEPALIVE` with `TCP_KEEPIDLE`,
+the only timer reachable here without a privilege or a peer that stops
+answering. One socket is given a ten-minute idle, so its remaining time must
+be inside the thirty-second window the probe holds its sockets for and below
+the value `setsockopt` was given. A second socket is given nine seconds,
+because `ss` renders a remaining time under ten seconds to the millisecond
+and anything longer to the second or the minute: that one is read in a
+sandwich, `ss` then sockv then `ss`, and the countdown read in the middle
+must lie between the two. A measured run: `8830 <= 8845 <= 8853` ms. When the
+timer fires and re-arms inside the window the later reading is the larger
+one, which is churn rather than disagreement, so that attempt is retried.
+
+The timer column is the one where a passing comparison proves least on its
+own. Over a corpus of sockets with no timer running it is a column of zeroes
+that agrees with `ss` perfectly, and it would agree just as well if the field
+were never read, which is why the arrival count is required to be non-zero
+and why the probe arms a timer it chose.
+
+### What the comparison does not cover
+
+The expiry is not compared to `ss` by the column differential, only bounded
+by the two mechanisms above. `ss` renders it through a formatter that drops
+the milliseconds above nine seconds and the seconds above nine minutes, so
+`11sec` is any value in a one-second range; sockv prints the raw millisecond
+count the kernel gave instead of reproducing that formatter.
+
+A retransmit count is not compared against `ss` for a socket with no timer
+running, because `ss` prints that count only inside its timer token and so
+reports nothing there either. The fixture and the probe cover it.
+
+`ss -i` prints dozens of further tokens out of `tcp_info`: `cwnd`, `rtt`,
+`wscale`, byte counters. Only the congestion control name is implemented
+here, `INET_DIAG_INFO` is not requested at all, and the rest of that line is
+in the list of what does not work below.
+
 ## Build
 
 ```
 make            # sockv, and t/probe
 make test       # the oracle
 make test-asan  # the same suite under ASan and UBSan
-make mutants    # can the suite fail? plants 35 defects and asserts the verdict
+make mutants    # can the suite fail? plants 53 defects and asserts the verdict
 ```
+
+`make test` also runs `t/mutants.sh --check-quiet` first, which asks whether
+every pattern in the mutation table still matches exactly one line of
+`sockv.c`. A pattern that has stopped matching is a mutant that tests
+nothing, and it goes stale silently: adding an argument to `row()` broke one,
+and the only thing that said so was that check. It is called from the
+Makefile and deliberately not from `t/run.sh`, because the check reads
+`sockv.c` and a mutation sweep rewrites it. Run from inside the suite it
+would fail during every mutant for that reason alone and the sweep would read
+the red suite as the mutant having been caught, scoring every mutation as
+killed. `t/mutants.sh` invokes `t/run.sh` directly, so the sweep never
+reaches that line.
 
 Pure C11, Linux only, no dependencies. The netlink socket is driven with
 `socket(AF_NETLINK, SOCK_RAW, NETLINK_SOCK_DIAG)`, `sendmsg(2)` and
@@ -138,8 +315,19 @@ socket sockv reports was also reported by `ss` passes trivially for a program
 that reports nothing, so every socket `ss` saw across the whole of sockv's run
 must also appear in sockv's output. And because two empty sets compare equal,
 each differential emits a **second, separately named assertion about how many
-sockets it compared**: 1544 in the run below, and a count under the floor
+sockets it compared**: 1641 in the run below, and a count under the floor
 is a failure, not a pass.
+
+Six more differentials compare one extension column at a time, which makes
+`ss` a per-field oracle here rather than a per-socket one: `ss -o` for the
+timer, `ss -m` for the memory counters, `ss -i` for the congestion control
+name, and the Recv-Q/Send-Q pair that `ss` prints by default. Each projects
+both programs down to a socket key plus that one column, so a disagreement
+names the column instead of saying that two rows differ. Each `ss` command
+carries exactly the one flag whose column is being read, because the flags
+interfere: `-i` adds `ino:` and `dev:` tokens to a UNIX row where `ino:` is
+the socket file's inode and not the socket's, and reading the wrong one would
+compare two different numbers and call them equal.
 
 The live-system race is handled by sandwiching, not by hoping. `ss`
 runs, then sockv, then `ss` again. A socket present in both `ss` runs existed
@@ -169,8 +357,13 @@ specific: the differential can only say "these sets differ", and these
 assertions say which socket and which field.
 
 A further assertion checks that `ss` reports all twenty of those inodes,
-because a socket count of 1544 and a set of twenty known sockets are each
+because a socket count of 1641 and a set of twenty known sockets are each
 weak alone and strong together.
+
+The extension columns lean on this oracle harder than on `ss`, because the
+probe's sockets are quiet and `ss` can only ever give a second reading of a
+moving number. It also arms the one timer reachable here. See the section on
+the optional extensions above.
 
 3. `/proc/net/{tcp,tcp6,udp,udp6,unix}`, weakest, and ranked last for a
 reason worth stating. `ss` is a different program reading the same interface,
@@ -196,22 +389,44 @@ this machine happens to have.
 ## `make test`
 
 ```
-sockv vs ss utility, iproute2-6.15.0 on 7.2.8-200.fc44.x86_64
+sockv vs ss utility, iproute2-6.15.0 on 7.2.13-200.fc44.x86_64
 
-ok    tcp+udp, all states: ss agrees both ways (100 sockets)
-ok    tcp+udp, all states: compared 100 sockets (>= 4)
-ok    tcp+udp, listening: ss agrees both ways (25 sockets)
-ok    tcp+udp, listening: compared 25 sockets (>= 1)
-ok    unix, all states: ss agrees both ways (1452 sockets)
-ok    unix, all states: compared 1452 sockets (>= 4)
-ok    unix, listening: ss agrees both ways (178 sockets)
-ok    unix, listening: compared 178 sockets (>= 1)
-ok    tcp+udp+unix together: ss agrees both ways (1552 sockets)
-ok    tcp+udp+unix together: compared 1552 sockets (>= 8)
-ok    -t -u -x partition the default listing (1552 rows)
+ok    tcp+udp, all states: ss agrees both ways (60 sockets)
+ok    tcp+udp, all states: compared 60 sockets (>= 4)
+ok    tcp+udp, listening: ss agrees both ways (24 sockets)
+ok    tcp+udp, listening: compared 24 sockets (>= 1)
+ok    unix, all states: ss agrees both ways (1581 sockets)
+ok    unix, all states: compared 1581 sockets (>= 4)
+ok    unix, listening: ss agrees both ways (181 sockets)
+ok    unix, listening: compared 181 sockets (>= 1)
+ok    tcp+udp+unix together: ss agrees both ways (1641 sockets)
+ok    tcp+udp+unix together: compared 1641 sockets (>= 8)
+ok    queue lengths, inet: ss agrees both ways (60 sockets)
+ok    queue lengths, inet: compared 60 sockets (>= 4)
+ok    timer, inet vs ss -o: ss agrees both ways (60 sockets)
+ok    timer, inet vs ss -o: compared 60 sockets (>= 4)
+ok    skmem, inet vs ss -m: ss agrees both ways (60 sockets)
+ok    skmem, inet vs ss -m: compared 60 sockets (>= 4)
+ok    cong, inet vs ss -i: ss agrees both ways (60 sockets)
+ok    cong, inet vs ss -i: compared 60 sockets (>= 4)
+ok    queue lengths, unix: ss agrees both ways (1581 sockets)
+ok    queue lengths, unix: compared 1581 sockets (>= 4)
+ok    skmem, unix vs ss -m: ss agrees both ways (1581 sockets)
+ok    skmem, unix vs ss -m: compared 1581 sockets (>= 4)
+ok    -t -u -x partition the default listing (1641 rows)
 ok    each family flag yields only its own netids
 skip  unix uid against ss  (ss -e does not report uid for unix sockets)
 ok    no duplicate rows
+ok    no -o -m -i: nothing optional arrives
+ok    -m asks for the memory counters only (25 of 37 records)
+ok    -i asks for the congestion control name only (25 of 37 records)
+ok    udiag_show brings back rqlen and meminfo (1581 and 1581 of 1581)
+ok    the kernel declines INET_DIAG_CONG for all 23 udp sockets
+ok    skmem arrivals equal the rows showing one (1629)
+ok    cong arrivals equal the rows showing one (25)
+ok    timer count equals the rows with a timer running (26)
+ok    the 12 inet socket(s) that declined are in state(s): TIME-WAIT 
+ok    unix_diag has no timer and no congestion control, on every row
 ok    v4 endpoint
 ok    v4 listener and %ifname scope
 ok    v6 endpoint in brackets
@@ -229,6 +444,12 @@ ok    unix name bounded by nla_len, not by a NUL
 ok    two records in one datagram
 ok    unknown attribute type is ignored
 ok    unaligned nlmsg_len keeps the next record
+ok    extension columns, every one populated
+ok    an extension the kernel did not send reads as -
+ok    a timer number this build does not know
+ok    more memory counters than this build knows
+ok    unix queue lengths come from UNIX_DIAG_RQLEN
+ok    a short memory array nobody asked for is not read
 ok    buffer shorter than an nlmsghdr
 ok    nlmsg_len below the header size
 ok    nlmsg_len of zero
@@ -236,6 +457,7 @@ ok    nlmsg_len past the end of the buffer
 ok    nlmsg_len of 0xffffffff does not wrap
 ok    truncated final record
 ok    payload too small for inet_diag_msg
+ok    payload too small for unix_diag_msg
 ok    nla_len below the attribute header
 ok    nla_len past the end of its message
 ok    attribute area ends mid-header
@@ -243,6 +465,11 @@ ok    u8 attribute with no payload
 ok    unix name longer than sun_path
 ok    address family we never asked for
 ok    nlmsg_type we never asked for
+ok    memory array shorter than SK_MEMINFO_VARS
+ok    memory array shorter than its claim, and last in the reply
+ok    congestion control name with no terminator
+ok    congestion control name too long to hold
+ok    unix_diag_rqlen with one of its two counters
 ok    NLMSG_ERROR is reported with its errno
 ok    NLMSG_ERROR with no room for an errno
 ok    NLM_F_DUMP_INTR is not a listing
@@ -250,14 +477,14 @@ ok    --parse with an unknown protocol
 ok    --parse with a missing file
 ok    --parse with no arguments
 ok    --parse of an empty file
-ok    /proc/net/{tcp,tcp6,udp,udp6} inode+uid+port (100 rows)
-ok    /proc/net/{tcp,tcp6,udp,udp6} inode+uid+port: compared 100 rows (>= 4)
-ok    /proc/net/unix inode+name (1452 rows)
-ok    /proc/net/unix inode+name: compared 1452 rows (>= 4)
+ok    /proc/net/{tcp,tcp6,udp,udp6} inode+uid+port (60 rows)
+ok    /proc/net/{tcp,tcp6,udp,udp6} inode+uid+port: compared 60 rows (>= 4)
+ok    /proc/net/unix inode+name (1581 rows)
+ok    /proc/net/unix inode+name: compared 1581 rows (>= 4)
 note: 0 /proc/net/unix row(s) carry inode 0 and are excluded;
       sock_diag does not enumerate a socket with no struct socket
 ok    /proc/net/unix: the inode-0 exclusion stays small
-ok    the probe brought its sockets up (ports 47432..47437)
+ok    the probe brought its sockets up (ports 49720..49725)
 ok    created: tcp4-listen
 ok    created: tcp4-client
 ok    created: tcp4-server
@@ -278,55 +505,67 @@ ok    created: unix-dgram
 ok    created: unix-seqpacket
 ok    created: unix-socketpair-a
 ok    created: unix-socketpair-b
+ok    skmem rb/tb from getsockopt: tcp4-listen
+ok    skmem rb/tb from getsockopt: tcp4-client
+ok    skmem rb/tb from getsockopt: udp4-bound
+ok    skmem rb/tb from getsockopt: unix-abstract-listen
+ok    skmem rb/tb from getsockopt: unix-socketpair-a
+ok    listen backlog is Send-Q: tcp4-listen
+ok    listen backlog is Send-Q: unix-abstract-listen
+ok    keepalive timer: tcp4-client (599891ms of 600000)
+ok    keepalive timer: tcp4-server (8891ms of 9000)
+ok    28 of 1662 records carried a timer
+ok    the timer expiry is between two ss readings (8732 <= 8752 <= 8766 ms)
 ok    unix name containing spaces appears verbatim
 ok    bound-only TCP socket is absent from /proc/net/tcp
 ok    ss sees all 20 sockets the probe created
-ok    --records reports the kernel record count (112)
+ok    --records reports the kernel record count (72)
 ok    --port: kernel bytecode selects what userspace selection does (4 rows)
 ok    --port vs ss: ss agrees both ways (4 sockets)
 ok    --port vs ss: compared 4 sockets (>= 1)
 ok    --port vs ss: the kernel sent 4 records and sockv printed 4 rows
-ok    --port vs ss: the kernel sent 4 records, an unfiltered dump 112
-ok    --addr v4: kernel bytecode selects what userspace selection does (43 rows)
-ok    --addr v4 vs ss: ss agrees both ways (43 sockets)
-ok    --addr v4 vs ss: compared 43 sockets (>= 1)
-ok    --addr v4 vs ss: the kernel sent 43 records and sockv printed 43 rows
-ok    --addr v4 vs ss: the kernel sent 43 records, an unfiltered dump 112
-ok    --addr v4 /8: kernel bytecode selects what userspace selection does (47 rows)
-ok    --addr v4 /8 vs ss: ss agrees both ways (47 sockets)
-ok    --addr v4 /8 vs ss: compared 47 sockets (>= 1)
-ok    --addr v4 /8 vs ss: the kernel sent 47 records and sockv printed 47 rows
-ok    --addr v4 /8 vs ss: the kernel sent 47 records, an unfiltered dump 112
-ok    --addr v6: kernel bytecode selects what userspace selection does (38 rows)
-ok    --addr v6 vs ss: ss agrees both ways (38 sockets)
-ok    --addr v6 vs ss: compared 38 sockets (>= 1)
-ok    --addr v6 vs ss: the kernel sent 38 records and sockv printed 38 rows
-ok    --addr v6 vs ss: the kernel sent 38 records, an unfiltered dump 112
+ok    --port vs ss: the kernel sent 4 records, an unfiltered dump 72
+ok    --addr v4: kernel bytecode selects what userspace selection does (16 rows)
+ok    --addr v4 vs ss: ss agrees both ways (16 sockets)
+ok    --addr v4 vs ss: compared 16 sockets (>= 1)
+ok    --addr v4 vs ss: the kernel sent 16 records and sockv printed 16 rows
+ok    --addr v4 vs ss: the kernel sent 16 records, an unfiltered dump 72
+ok    --addr v4 /8: kernel bytecode selects what userspace selection does (20 rows)
+ok    --addr v4 /8 vs ss: ss agrees both ways (20 sockets)
+ok    --addr v4 /8 vs ss: compared 20 sockets (>= 1)
+ok    --addr v4 /8 vs ss: the kernel sent 20 records and sockv printed 20 rows
+ok    --addr v4 /8 vs ss: the kernel sent 20 records, an unfiltered dump 72
+ok    --addr v6: kernel bytecode selects what userspace selection does (11 rows)
+ok    --addr v6 vs ss: ss agrees both ways (11 sockets)
+ok    --addr v6 vs ss: compared 11 sockets (>= 1)
+ok    --addr v6 vs ss: the kernel sent 11 records and sockv printed 11 rows
+ok    --addr v6 vs ss: the kernel sent 11 records, an unfiltered dump 72
 ok    --dev: kernel bytecode selects what userspace selection does (3 rows)
 ok    --dev vs ss: ss agrees both ways (3 sockets)
 ok    --dev vs ss: compared 3 sockets (>= 1)
 ok    --dev vs ss: the kernel sent 3 records and sockv printed 3 rows
-ok    --dev vs ss: the kernel sent 3 records, an unfiltered dump 112
+ok    --dev vs ss: the kernel sent 3 records, an unfiltered dump 72
 ok    --port --dev: kernel bytecode selects what userspace selection does (1 rows)
 ok    --port --dev vs ss: ss agrees both ways (1 sockets)
 ok    --port --dev vs ss: compared 1 sockets (>= 1)
 ok    --port --dev vs ss: the kernel sent 1 records and sockv printed 1 rows
-ok    --port --dev vs ss: the kernel sent 1 records, an unfiltered dump 112
-ok    --addr 0.0.0.0/0: kernel bytecode selects what userspace selection does (65 rows)
-ok    --addr 0.0.0.0/0 vs ss: ss agrees both ways (65 sockets)
-ok    --addr 0.0.0.0/0 vs ss: compared 65 sockets (>= 1)
-ok    --addr 0.0.0.0/0 vs ss: the kernel sent 65 records and sockv printed 65 rows
-ok    --addr 0.0.0.0/0 vs ss: the kernel sent 65 records, an unfiltered dump 112
-ok    --addr ::/0: kernel bytecode selects what userspace selection does (47 rows)
-ok    --addr ::/0 vs ss: ss agrees both ways (47 sockets)
-ok    --addr ::/0 vs ss: compared 47 sockets (>= 1)
-ok    --addr ::/0 vs ss: the kernel sent 47 records and sockv printed 47 rows
-ok    --addr ::/0 vs ss: the kernel sent 47 records, an unfiltered dump 112
+ok    --port --dev vs ss: the kernel sent 1 records, an unfiltered dump 72
+ok    --addr 0.0.0.0/0: kernel bytecode selects what userspace selection does (53 rows)
+ok    --addr 0.0.0.0/0 vs ss: ss agrees both ways (53 sockets)
+ok    --addr 0.0.0.0/0 vs ss: compared 53 sockets (>= 1)
+ok    --addr 0.0.0.0/0 vs ss: the kernel sent 53 records and sockv printed 53 rows
+ok    --addr 0.0.0.0/0 vs ss: the kernel sent 53 records, an unfiltered dump 72
+ok    --addr ::/0: kernel bytecode selects what userspace selection does (19 rows)
+ok    --addr ::/0 vs ss: ss agrees both ways (19 sockets)
+ok    --addr ::/0 vs ss: compared 19 sockets (>= 1)
+ok    --addr ::/0 vs ss: the kernel sent 19 records and sockv printed 19 rows
+ok    --addr ::/0 vs ss: the kernel sent 19 records, an unfiltered dump 72
 ok    --port selects the probe listener and not its udp socket
 ok    --addr 127.0.0.1 selects the v4 listener and not the v6 one
 ok    --addr ::1 selects the v6 listener and not the v4 one
 ok    --dev lo selects the scope-bound socket and not an unbound one
 ok    a port nothing is bound to returns no records
+ok    a filter and an extension in one request (4 records, skmem 4)
 ok    -x with a filter is refused
 ok    --port with no value
 ok    --port out of range
@@ -340,8 +579,10 @@ ok    unknown option
 ok    stray argument
 ok    --help exits 0
 ok    listing exits 0
+ok    -omi listing exits 0
+ok    -m with -x is not refused
 
-139 passed, 0 failed, 1 skipped
+187 passed, 0 failed, 1 skipped
 ```
 
 Exit status is part of the interface, because the suite asserts on it: `0`
@@ -355,36 +596,45 @@ version and the reason. A skip is never dressed up as a pass.
 
 ## Have I watched this harness fail?
 
-`make mutants` plants 35 defects in `sockv.c` with `sed`, builds each one, runs
+`make mutants` plants 53 defects in `sockv.c` with `sed`, builds each one, runs
 the whole suite against the broken binary, and asserts the verdict. Two
 mutants are expected to *survive*, and asserting that is the point. A
 survivor that starts being caught fails the script too, because at that moment
 this README is the thing that has become wrong.
 
-```
-ok     (no defect planted)                    139 passed, 0 failed, 1 skipped
+`t/mutants.sh --check` applies every one of those patterns without building
+or running anything, and requires each to change exactly one line. It exists
+because a pattern goes stale silently: adding an argument to `row()` stopped
+`uid hardcoded to zero` from matching at all, which the check reported at
+once. It also found two patterns that had always been looser than they read,
+one changing a comment as well as its line and one hitting both of two call
+sites, which is the shape that once made a real defect look provably
+equivalent. `--check-quiet` is the form `make test` runs.
 
-ok     port printed without ntohs             caught by 42 assertion(s)
+```
+ok     (no defect planted)                    187 passed, 0 failed, 1 skipped
+
+ok     port printed without ntohs             caught by 51 assertion(s)
          tcp+udp, all states: ss agrees both ways
          tcp+udp, listening: ss agrees both ways
          tcp+udp+unix together: ss agrees both ways
-ok     AF_INET address read as 16 bytes       caught by 26 assertion(s)
+ok     AF_INET address read as 16 bytes       caught by 35 assertion(s)
          tcp+udp, all states: ss agrees both ways
          tcp+udp, listening: ss agrees both ways
          tcp+udp+unix together: ss agrees both ways
-ok     INET_DIAG_SKV6ONLY ignored             caught by 7 assertion(s)
+ok     INET_DIAG_SKV6ONLY ignored             caught by 11 assertion(s)
          tcp+udp, all states: ss agrees both ways
          tcp+udp, listening: ss agrees both ways
          tcp+udp+unix together: ss agrees both ways
-ok     ifindex scope suffix dropped           caught by 14 assertion(s)
+ok     ifindex scope suffix dropped           caught by 18 assertion(s)
          tcp+udp, all states: ss agrees both ways
          tcp+udp, listening: ss agrees both ways
          tcp+udp+unix together: ss agrees both ways
-ok     uid hardcoded to zero                  caught by 35 assertion(s)
+ok     uid hardcoded to zero                  caught by 40 assertion(s)
          tcp+udp, all states: ss agrees both ways
          tcp+udp, listening: ss agrees both ways
          v4 endpoint
-ok     local and peer endpoints swapped       caught by 34 assertion(s)
+ok     local and peer endpoints swapped       caught by 43 assertion(s)
          tcp+udp, all states: ss agrees both ways
          tcp+udp, listening: ss agrees both ways
          tcp+udp+unix together: ss agrees both ways
@@ -392,7 +642,7 @@ ok     abstract name loses its @              caught by 8 assertion(s)
          unix, all states: ss agrees both ways
          unix, listening: ss agrees both ways
          tcp+udp+unix together: ss agrees both ways
-ok     u_dgr relabelled u_str                 caught by 5 assertion(s)
+ok     u_dgr relabelled u_str                 caught by 7 assertion(s)
          unix, all states: ss agrees both ways
          unix, listening: ss agrees both ways
          tcp+udp+unix together: ss agrees both ways
@@ -400,7 +650,7 @@ ok     UNIX_DIAG_PEER ignored                 caught by 7 assertion(s)
          unix, all states: ss agrees both ways
          tcp+udp+unix together: ss agrees both ways
          unix unnamed, with a peer inode
-ok     every unix socket reads as unnamed     caught by 15 assertion(s)
+ok     every unix socket reads as unnamed     caught by 16 assertion(s)
          unix, all states: ss agrees both ways
          unix, listening: ss agrees both ways
          tcp+udp+unix together: ss agrees both ways
@@ -408,10 +658,10 @@ ok     -l uses TCP_LISTEN for UDP             caught by 1 assertion(s)
          tcp+udp, listening: ss agrees both ways
 ok     -l drops the TCP_CLOSE half of the unix state mask caught by 1 assertion(s)
          unix, listening: ss agrees both ways
-ok     bytecode attribute never attached      caught by 24 assertion(s)
+ok     bytecode attribute never attached      caught by 29 assertion(s)
          --port: kernel bytecode selects what userspace selection does
          --port vs ss: ss agrees both ways
-         --port vs ss: the kernel sent 91 records, an unfiltered dump 91
+         --port vs ss: the kernel sent 102 records, an unfiltered dump 102
 ok     filter tests the peer end, not the local caught by 13 assertion(s)
          --port: kernel bytecode selects what userspace selection does
          --port vs ss: ss agrees both ways
@@ -419,8 +669,8 @@ ok     filter tests the peer end, not the local caught by 13 assertion(s)
 ok     hostcond port left as -1 (any port)    caught by 7 assertion(s)
          --port: kernel bytecode selects what userspace selection does
          --port vs ss: ss agrees both ways
-         --port vs ss: the kernel sent 83 records, an unfiltered dump 83
-ok     hostcond port sent big-endian          caught by 17 assertion(s)
+         --port vs ss: the kernel sent 105 records, an unfiltered dump 105
+ok     hostcond port sent big-endian          caught by 18 assertion(s)
          --port: kernel bytecode selects what userspace selection does
          --port vs ss: ss agrees both ways
          --addr v4: kernel bytecode selects what userspace selection does
@@ -431,18 +681,18 @@ ok     hostcond prefix length zeroed          caught by 6 assertion(s)
 ok     reject jump lands on the end, not past it caught by 29 assertion(s)
          --port: kernel bytecode selects what userspace selection does
          --port vs ss: ss agrees both ways
-         --port vs ss: the kernel sent 89 records, an unfiltered dump 89
+         --port vs ss: the kernel sent 105 records, an unfiltered dump 105
 ok     DEV_COND ifindex operand never written caught by 5 assertion(s)
          --dev: kernel bytecode selects what userspace selection does
          --dev vs ss: ss agrees both ways
          --port --dev: kernel bytecode selects what userspace selection does
-ok     the record counter does not count      caught by 17 assertion(s)
+ok     the record counter does not count      caught by 18 assertion(s)
          --records reports the kernel record count
-         --port vs ss: the kernel sent 0 records and sockv printed 4 rows
+         --port vs ss: the kernel sent 0 records and sockv printed 6 rows
          --port vs ss: the kernel sent 0 records, an unfiltered dump 0
 ok     a filter flag given twice is quietly ANDed caught by 1 assertion(s)
          --port given twice is refused
-ok     only the first record is read          caught by 40 assertion(s)
+ok     only the first record is read          caught by 52 assertion(s)
          tcp+udp, all states: ss agrees both ways
          tcp+udp, listening: ss agrees both ways
          unix, all states: ss agrees both ways
@@ -461,8 +711,10 @@ ok     nla_len lower bound deleted            caught by 1 assertion(s)
          nla_len below the attribute header
 ok     nla_len upper bound deleted            caught by 1 assertion(s)
          nla_len past the end of its message
-ok     payload size check deleted             caught by 1 assertion(s)
+ok     inet payload size check deleted        caught by 1 assertion(s)
          payload too small for inet_diag_msg
+ok     unix payload size check deleted        caught by 1 assertion(s)
+         payload too small for unix_diag_msg
 ok     unix name length check deleted         caught by 1 assertion(s)
          unix name longer than sun_path
 ok     u8 attribute length check deleted      caught by 1 assertion(s)
@@ -471,6 +723,65 @@ ok     NLM_F_DUMP_INTR ignored                caught by 1 assertion(s)
          NLM_F_DUMP_INTR is not a listing
 ok     attribute end-of-buffer loosened by 4  caught by 1 assertion(s)
          u8 attribute with no payload
+ok     idiag_ext never set on the request     caught by 9 assertion(s)
+         skmem, inet vs ss -m: ss agrees both ways
+         cong, inet vs ss -i: ss agrees both ways
+         -m asks for the memory counters only
+ok     idiag_ext bit computed without the -1  caught by 7 assertion(s)
+         skmem, inet vs ss -m: ss agrees both ways
+         -m asks for the memory counters only
+         the inet sockets that declined are the ones with no struct sock
+ok     UDIAG_SHOW_RQLEN never requested       caught by 3 assertion(s)
+         queue lengths, unix: ss agrees both ways
+         udiag_show brings back rqlen and meminfo
+         listen backlog is Send-Q: unix-abstract-listen
+ok     UDIAG_SHOW_MEMINFO never requested     caught by 4 assertion(s)
+         skmem, unix vs ss -m: ss agrees both ways
+         udiag_show brings back rqlen and meminfo
+         skmem rb/tb from getsockopt: unix-abstract-listen
+ok     Recv-Q and Send-Q swapped              caught by 3 assertion(s)
+         queue lengths, inet: ss agrees both ways
+         extension columns, every one populated
+         listen backlog is Send-Q: tcp4-listen
+ok     the timer name table is off by one     caught by 4 assertion(s)
+         timer, inet vs ss -o: ss agrees both ways
+         extension columns, every one populated
+         keepalive timer: tcp4-client
+ok     the timer expiry is always zero        caught by 5 assertion(s)
+         extension columns, every one populated
+         a timer number this build does not know
+         keepalive timer: tcp4-client
+ok     the skmem labels are in the wrong order caught by 9 assertion(s)
+         skmem, inet vs ss -m: ss agrees both ways
+         skmem, unix vs ss -m: ss agrees both ways
+         extension columns, every one populated
+ok     a declined attribute prints as zeroes  caught by 3 assertion(s)
+         skmem, inet vs ss -m: ss agrees both ways
+         skmem arrivals equal the rows showing one (1627)
+         an extension the kernel did not send reads as -
+ok     the skmem arrival counter does not count caught by 4 assertion(s)
+         -m asks for the memory counters only
+         udiag_show brings back rqlen and meminfo
+         skmem arrivals equal the rows showing one (0)
+ok     the cong arrival counter does not count caught by 2 assertion(s)
+         -i asks for the congestion control name only
+         cong arrivals equal the rows showing one (0)
+ok     the timer counter does not count       caught by 2 assertion(s)
+         timer count equals the rows with a timer running (0)
+         some record carried a timer
+ok     skmem array length check deleted       caught by 2 assertion(s)
+         memory array shorter than SK_MEMINFO_VARS
+         memory array shorter than its claim, and last in the reply
+ok     cong empty-attribute check deleted     caught by 1 assertion(s)
+         congestion control name with no terminator
+ok     cong over-long name check deleted      caught by 1 assertion(s)
+         congestion control name too long to hold
+ok     unix_diag_rqlen length check deleted   caught by 1 assertion(s)
+         unix_diag_rqlen with one of its two counters
+ok     unix memory counters read from the wrong attribute caught by 8 assertion(s)
+         queue lengths, unix: ss agrees both ways
+         skmem, unix vs ss -m: ss agrees both ways
+         udiag_show brings back rqlen and meminfo
 ok     record end-of-buffer loosened by 4     survived, as documented
          provably equivalent: the test fires after the record has been
          processed, so the mutant only declines to look for a further
@@ -485,16 +796,24 @@ ok     MSG_TRUNC check deleted                survived, as documented
 
 AddressSanitizer, both netlink bounds deleted:
 ok     overread is reported                   heap-buffer-overflow, exit 86
+ok     skmem overread is reported             heap-buffer-overflow, exit 86
 
-37 passed, 0 failed
+56 passed, 0 failed
 ```
 
 The counts move a little from run to run, because most of them include the
 live differentials and the machine's socket table is not the same twice. What
 does not move is the shape, and the shape is the diagnosis, not an
-alarm: the IPv4-only defect fails seventeen assertions of which **not one is
-an IPv6 assertion**, a deleted bounds check fails one or two by name, and a
-dropped record fails twenty-five.
+alarm: the IPv4-only defect fails 35 assertions and **not one of them is an
+IPv6 assertion**, a deleted bounds check fails one or two by name, and a
+dropped record fails 51.
+
+The extension mutants separate along the same lines. `the timer expiry is
+always zero` is caught only by the `--parse` fixture and by the probe's own
+keepalive socket, because the expiry is the one sub-field the differential
+against `ss` deliberately does not compare. `the skmem arrival counter does
+not count` is caught only by the count assertions, which is the whole reason
+they exist: the listing is identical either way.
 
 ### The two that survive
 
@@ -578,23 +897,38 @@ above.
   not attempt it. The uid column is what it offers instead. This is a
   deliberate non-goal, not a privilege skip, because the information is
   not in the interface this program reads.
-- No queue lengths, timers, retransmits, congestion control, memory
-  accounting or TCP info. `inet_diag_msg` carries `idiag_rqueue`,
-  `idiag_wqueue`, `idiag_timer`, `idiag_retrans` and `idiag_expires`, and
-  `idiag_ext` can request `INET_DIAG_INFO`, `INET_DIAG_MEMINFO`,
-  `INET_DIAG_CONG` and more. sockv requests `idiag_ext = 0` and prints none of
-  it. The two Recv-Q/Send-Q columns `ss` prints are therefore not compared by
-  the differential either.
+- No `tcp_info`. `idiag_ext` can request `INET_DIAG_INFO`, which is the
+  struct behind most of what `ss -i` prints: `cwnd`, `rtt`, `rto`, `wscale`,
+  the byte and segment counters, `pacing_rate`, `delivery_rate`. sockv does
+  not request it and prints none of it. `-i` here is the congestion control
+  name from `INET_DIAG_CONG` and nothing else, which is one token of a line
+  `ss` fills with forty.
+- No `INET_DIAG_MEMINFO`, the four-counter `inet_diag_meminfo`. `-m` reports
+  `INET_DIAG_SKMEMINFO`, the nine `SK_MEMINFO_VARS` counters, which is what
+  `ss -m` prints. `ss` falls back to the four-counter form when the nine are
+  absent, and sockv has no such fallback: there would be no oracle for it,
+  because `ss` only prints that form on a kernel too old to send the other.
+- No `INET_DIAG_TOS`, `INET_DIAG_TCLASS`, `INET_DIAG_SHUTDOWN` or
+  `INET_DIAG_VEGASINFO`. `ss` prints the shutdown state as the `<->`, `-->`,
+  `<--` and `---` marker at the end of each row; sockv does not.
 - No `INET_DIAG_MARK`, which needs `CAP_NET_ADMIN`. Not implemented, so
   nothing is skipped for want of privileges here.
+- The timer expiry is printed as a raw millisecond count, not the way `ss`
+  renders it. `ss` drops the milliseconds above nine seconds and the seconds
+  above nine minutes, so its `11sec` is any value in a one-second range.
+  Reproducing that formatter would mean guessing at it or copying it, and
+  the number is a countdown that the two programs read at two different
+  instants, so there is no byte-for-byte comparison to be had either way.
+  What the suite does instead is in the section on the extensions above.
 - UNIX uid is not corroborated by `ss`. `ss -e` reports no uid for UNIX
   sockets, so the UNIX differentials compare five fields where the inet ones
   compare six, and the suite prints that as an explicit `skip` line rather
   than quietly comparing less. The UNIX uid column is checked against the
   twenty sockets the probe creates, where the expected value is known.
-- No `UNIX_DIAG_VFS`, `ICONS`, `RQLEN` or `SHUTDOWN`. `ss -e` prints the
-  socket file's `ino:`/`dev:` for a path-bound UNIX socket, and the pending
-  connection queue for a listener. Not implemented.
+- No `UNIX_DIAG_VFS`, `ICONS` or `SHUTDOWN`. `ss -e` prints the socket
+  file's `ino:`/`dev:` for a path-bound UNIX socket, and `ss -x` the list of
+  pending connections for a listener. Not implemented. `UNIX_DIAG_RQLEN` and
+  `UNIX_DIAG_MEMINFO` are, under `-o` and `-m`.
 
 ### Filtering
 
@@ -711,6 +1045,48 @@ above.
   at a time on a socket nobody else holds, and marked `shortcut:` where that
   assumption lives. The datagram's source port *is* checked, so a reply from
   anything other than the kernel is ignored.
+- The extension columns add two more buffers of that shape, and both were
+  measured rather than reasoned about. The row's extension string is a
+  256-byte stack buffer that holds about 90 bytes, and `fmt_cong` copies the
+  congestion control name into a 32-byte one that holds six. A read past the
+  data in either stays inside the object, where AddressSanitizer is blind by
+  construction, so the length checks in front of them are what matters and
+  each has its own `--parse` fixture and its own mutant.
+
+### What the sanitizers can and cannot see here
+
+Four reads were planted and measured, because two paragraphs of reasoning
+about this in METHOD were wrong in a row before anybody planted one. Built
+with `-fsanitize=address,undefined`, `halt_on_error=1`, `exitcode=86`, and
+separately under valgrind:
+
+```
+plant                                               ASan+UBSan      valgrind
+past the data inside the 256-byte row buffer        nothing, 0      uninit, 86
+past the name inside fmt_cong's char name[32]       nothing, 0      uninit, 86
+skmem length check deleted, NLMSG_DONE after it     nothing, 0      nothing, 0
+skmem length check deleted, attribute last          heap-bo, 86     read 4, 86
+cong length check deleted, 40 bytes into name[32]   stack-bo, 86    nothing, 0
+```
+
+Five rows, and neither tool sees more than three of them. The two that stay
+inside a live stack object are invisible to AddressSanitizer and caught by
+valgrind, which reads them as uninitialised rather than as out of bounds:
+the same asymmetry `sha2` hit on the day this was written, where a case only
+valgrind could see had ASan, UBSan and MSan all silent. The one that reads
+past a heap allocation is the reverse, caught by both. The stack smash is
+caught by AddressSanitizer alone, because valgrind does not track the bounds
+of arrays inside a frame.
+
+The third row is the interesting one and it is not about the program at all.
+The same deleted check, the same four bytes read past the same attribute,
+and whether the sanitizer can see it depends on whether the fixture puts a
+`NLMSG_DONE` record after that attribute or ends the reply there. With a
+record following, the overread lands inside the same allocation and nothing
+is reported. So `t/probe emit` builds both shapes, the suite refuses both by
+exit code, and `make mutants` runs the sanitised plant against the one that
+ends the reply. A fixture can turn a sanitizer off as effectively as a
+rounded-up buffer can.
 
 ### Environment
 
@@ -732,7 +1108,7 @@ above.
 
 ## Design
 
-One file, `sockv.c`, 1152 lines, about a quarter of them comments explaining why
+One file, `sockv.c`, 1409 lines, about a quarter of them comments explaining why
 the kernel or `ss` insists on something.
 
 ```
@@ -741,11 +1117,12 @@ parse args  ->  compile --port/--addr/--dev to bytecode
             ->  per family and protocol:
                   sendmsg  inet_diag_req_v2 | unix_diag_req, NLM_F_DUMP
                            + INET_DIAG_REQ_BYTECODE when a filter was given
+                           + idiag_ext / udiag_show when -m or -i was given
                   recvmsg  -> walk() the records -> show_inet | show_unix
                   NLM_F_DUMP_INTR -> start that dump again
 ```
 
-Four decisions worth naming.
+Five decisions worth naming.
 
 The record walker is the whole security surface. Every bound is checked
 against the number of bytes `recvmsg` actually delivered, never against
@@ -764,6 +1141,13 @@ Output is `ss`'s, down to its quirks. State names are `ss`'s,
 not the kernel's enum names: `TCP_CLOSE` prints as `UNCONN`, and addresses are
 formatted the way `ss` formats them. The alternative is a translation table in
 the test harness, a place for a disagreement to hide.
+
+An absent optional attribute is a third outcome, not a zero. `idiag_ext` is
+a request and the kernel decides, so a column can be empty because nobody
+asked, because the kernel had nothing to report, or because the value really
+is zero. Printing `-` separates the first two from the third in the output,
+and the arrival counts `--records` prints separate the first from the second,
+which no comparison of listings could.
 
 An unknown attribute type is ignored. An unknown length is refused. The
 kernel grows the attribute enum every few releases and sends some of it unasked:

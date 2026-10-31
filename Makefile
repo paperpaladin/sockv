@@ -13,7 +13,20 @@ sockv: sockv.c
 t/probe: t/probe.c
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
+# t/mutants.sh --check-quiet asks whether every pattern in the mutation table
+# still matches exactly one line of sockv.c. A pattern that has stopped
+# matching is a mutant that tests nothing, and it goes stale silently: the
+# row above was broken by a change to row()'s argument list and reported
+# itself only when the sweep was next run, days later.
+#
+# It belongs HERE and not inside t/run.sh, and that placement is the whole
+# interlock. The check reads sockv.c; a mutation sweep rewrites sockv.c. Run
+# from inside the suite it would fail during every mutant for that reason
+# alone, and the sweep would read the red suite as the mutant having been
+# caught, scoring every mutation as killed. t/mutants.sh calls t/run.sh
+# directly, so the sweep never reaches this line.
 test: all
+	@t/mutants.sh --check-quiet
 	@t/run.sh
 
 # A netlink reply is untrusted input, so the whole suite has to pass with the
@@ -49,6 +62,5 @@ test-asan: sockv.c t/probe.c
 
 clean:
 	rm -f sockv sockv-san t/probe t/probe-san
-	rm -rf t/tmp
 
 .PHONY: all test test-asan mutants clean

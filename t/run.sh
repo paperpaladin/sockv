@@ -162,6 +162,159 @@ ss5() {
 }
 
 # ===========================================================================
+# the same thing one column at a time, for the columns -o, -m and -i add
+# ===========================================================================
+# ss asks the kernel for the same extensions and prints them, which makes it
+# a per-FIELD oracle here rather than a per-socket one. So each of the new
+# columns gets its own projection: key plus that column and nothing else, so
+# a disagreement names the column instead of saying that two rows differ.
+#
+# These values move, which is the whole difficulty. A queue length and a
+# memory counter change with traffic, and a timer's remaining time changes
+# every millisecond, so two readings seconds apart are two different states
+# and not a disagreement. Three things handle that and they are deliberately
+# different:
+#
+#  - For the live comparison, difftest's sandwich already does it. Only
+#    sockets whose projected row is identical in BOTH ss runs are required to
+#    be in sockv's output, so a socket whose counter moved during the window
+#    drops out of the claim rather than failing it. The count assertion is
+#    what stops that from becoming a silent narrowing: if the volatile
+#    columns emptied the stable set, the number falls under its floor and the
+#    assertion fails.
+#  - For exact per-field values, the sockets the probe owns. Nothing is sent
+#    on them, so their counters do not move at all, and the probe knows what
+#    rb, tb and the listen backlog must be from a different interface.
+#  - For the one value that is a countdown, a bound rather than an equality.
+#    See the keepalive assertions further down.
+#
+# sockv is always run with -omi so the extension columns sit at fixed
+# positions, and they are indexed from NF rather than from the left because a
+# UNIX socket name containing whitespace shifts the middle of a row and never
+# its end.
+#
+#   sockv -omi:  fam netid state local peer inode uid rq wq timer skmem cong
+mext() {
+	_c=$1; shift
+	"$S" -omi "$@" | awk -v c="$_c" '
+		{
+			if ($1 == "unix") key = $2 " " $3 " " $(NF-6)
+			else key = $2 " " $3 " " $4 " " $5 " " $(NF-6)
+			if (c == "q") { print key, $(NF-4), $(NF-3); next }
+			if (c == "sk") { print key, $(NF-1); next }
+			if (c == "cg") { print key, $NF; next }
+			tm = $(NF-2)
+			if (tm == "timer:-") { print key, "-"; next }
+			sub(/^timer:\(/, "", tm)
+			sub(/\)$/, "", tm)
+			split(tm, f, ",")
+			# The expiry is dropped here on purpose: it is the one
+			# sub-field that cannot be equated across two readings.
+			#
+			# A timer of "off" becomes "-" because that is the same
+			# statement ss makes by printing no timer token at all,
+			# and it is the kernel saying no timer is running rather
+			# than an attribute that failed to arrive. It does mean
+			# the retransmit count is not compared against ss for a
+			# socket with no timer, because ss prints that count
+			# only inside the timer token and so reports nothing
+			# there either. The fixture and the probe cover it.
+			print key, (f[1] == "off" ? "-" : f[1] "/" f[3])
+		}' | sort
+}
+
+# ss, projected the same way.
+#
+# -m and -i put their output on a continuation line for an inet socket and
+# inline for a UNIX one, so a continuation is folded back onto the row it
+# belongs to before anything is read off it.
+#
+# ss prints no token at all for an attribute it did not get, where sockv
+# prints "-", so an absence is mapped to "-" here. That is a mapping of
+# presence and not of value: there is no ss string for "the kernel declined"
+# for this to be wrong about.
+#
+# The congestion control name is the last token of the colon-free run that
+# follows ss's "<->" marker. ss prints bare flag words there ahead of the
+# name ("ts", "sack"), so taking the first colon-free token finds one of
+# those instead, and taking the whole run would include them. A row where
+# this picks the wrong token makes the comparison FAIL rather than pass,
+# which is the safe direction for a parser on the oracle's side of a
+# differential.
+sext() {
+	_c=$1; shift
+	ss "$@" 2>/dev/null | awk -v c="$_c" '
+		function emit(L,   i, j, ino, tm, sk, cg, key, f) {
+			$0 = L
+			tm = "-"; sk = "skmem:-"; cg = "cong:-"; ino = ""
+			if ($1 ~ /^u_/) {
+				if (NF < 8 || $6 !~ /^[0-9]+$/) { nf++; return }
+				key = $1 " " $2 " " $6
+				for (i = 9; i <= NF; i++)
+					if ($i ~ /^skmem:\(/) sk = $i
+			} else {
+				for (i = 7; i <= NF; i++) {
+					if ($i ~ /^ino:/) ino = substr($i, 5)
+					else if ($i ~ /^skmem:\(/) sk = $i
+					else if ($i ~ /^timer:\(/) {
+						tm = $i
+						sub(/^timer:\(/, "", tm)
+						sub(/\)$/, "", tm)
+						split(tm, f, ",")
+						tm = f[1] "/" f[3]
+					}
+					# The shutdown marker, and it is not
+					# always "<->": a socket whose peer has
+					# sent FIN prints "-->", and the other
+					# two forms are "<--" and "---". The
+					# first version of this matched the
+					# literal "<->" and so found no
+					# congestion control name for the one
+					# CLOSE-WAIT socket on the machine,
+					# which failed the comparison rather
+					# than passing it.
+					else if ($i ~ /^[<-]-[->]$/) j = i + 1
+				}
+				if (ino == "") ino = 0
+				key = $1 " " $2 " " $5 " " $6 " " ino
+				while (j && j <= NF && $j !~ /:/) {
+					cg = "cong:" $j
+					j++
+				}
+			}
+			if (c == "q") print key, $3, $4
+			else if (c == "sk") print key, sk
+			else if (c == "cg") print key, cg
+			else print key, tm
+		}
+		/^[[:blank:]]/ { held = held " " $0; next }
+		{
+			# emit() assigns to $0 to re-split the joined line,
+			# so $0 is no longer this line once it returns. The
+			# first version of this read $0 afterwards and set
+			# held to the row it had just emitted, which emitted
+			# every row again on the next line and grew without
+			# bound: ss appeared to report one socket fifty times.
+			cur = $0
+			if (held != "") emit(held)
+			held = cur
+		}
+		END { if (held != "") emit(held) }' | sort
+}
+
+# difftest calls "my$5" and "ss$5", so these wrappers are what let the whole
+# sandwich, both directions, the retries and the count floor be reused rather
+# than written again for each column.
+my_q()  { mext q  "$@"; }
+ss_q()  { sext q  "$@"; }
+my_tm() { mext tm "$@"; }
+ss_tm() { sext tm "$@"; }
+my_sk() { mext sk "$@"; }
+ss_sk() { sext sk "$@"; }
+my_cg() { mext cg "$@"; }
+ss_cg() { sext cg "$@"; }
+
+# ===========================================================================
 # the differential: both directions, with a count that proves it had teeth
 # ===========================================================================
 # difftest NAME MINROWS SOCKV_ARGS SS_ARGS NFIELDS
@@ -206,7 +359,10 @@ if [ "$HAVE_SS" = no ]; then
 	echo "independent reader to compare against and are SKIPPED."
 	for n in 'tcp+udp, all states' 'tcp+udp, listening' \
 	         'unix, all states' 'unix, listening' \
-	         'tcp+udp+unix together'; do
+	         'tcp+udp+unix together' 'queue lengths, inet' \
+	         'timer, inet vs ss -o' 'skmem, inet vs ss -m' \
+	         'cong, inet vs ss -i' 'queue lengths, unix' \
+	         'skmem, unix vs ss -m'; do
 		skipt "$n" "no ss(8)"
 		skipt "$n: teeth" "no ss(8)"
 	done
@@ -225,6 +381,23 @@ else
 	# three dumps compose on one netlink socket and that nothing is lost
 	# when they run back to back.
 	difftest 'tcp+udp+unix together'  8 '-tux' '-tuxanHe' 5
+
+	# One differential per new column. Each ss command carries exactly the
+	# one flag whose column is being read, because the flags interfere:
+	# -i adds ino: and dev: tokens to a UNIX row, where ino: is the
+	# socket FILE's inode and not the socket's, and reading the wrong one
+	# would compare two different numbers and call them equal.
+	difftest 'queue lengths, inet'    4 '-tu' '-tuaneH'  _q
+	difftest 'timer, inet vs ss -o'   4 '-tu' '-tuanoeH' _tm
+	difftest 'skmem, inet vs ss -m'   4 '-tu' '-tuanmeH' _sk
+	# A column where both sides agree on "-" everywhere would pass this
+	# while proving nothing, which is what the arrival counts further
+	# down are for: this says the values agree, those say there were
+	# values. The congestion control name is the sharpest case, since the
+	# kernel reports none at all for a UDP socket.
+	difftest 'cong, inet vs ss -i'    4 '-tu' '-tuanieH' _cg
+	difftest 'queue lengths, unix'    4 '-x'  '-xaneH'   _q
+	difftest 'skmem, unix vs ss -m'   4 '-x'  '-xanmeH'  _sk
 
 	if [ -s "$TD/unparsed" ]; then
 		skipt 'socket names containing whitespace' \
@@ -279,6 +452,147 @@ else
 fi
 
 # ===========================================================================
+# idiag_ext: a request is a wish, and the kernel decides what to answer
+# ===========================================================================
+# An output comparison cannot see any of this. A listing full of "-" is what
+# a request that never carried the mask looks like, and it is also what a
+# kernel declining to answer looks like, and it is also what a column of
+# agreeing absences looks like in a diff. So --records reports how many
+# records carried each optional attribute, and these are the assertions that
+# say the new code path ran at all. Same shape as the record count the
+# bytecode filters are judged by, for the same reason: the number is the only
+# witness.
+#
+# Three outcomes, counted apart. Arrived and agrees is the differentials
+# above. Arrived and disagrees is a failure there. Never arrived is neither,
+# and is what is counted here.
+ext_read() {
+	"$S" --records "$@" >"$TD/x.out" 2>"$TD/x.err"
+	_rec=$(sed -n 's/^records: //p' "$TD/x.err")
+	_sk=$(sed -n 's/^ext: skmem \([0-9]*\).*/\1/p' "$TD/x.err")
+	_cg=$(sed -n 's/^ext:.*cong \([0-9]*\).*/\1/p' "$TD/x.err")
+	_rq=$(sed -n 's/^ext:.*rqlen \([0-9]*\).*/\1/p' "$TD/x.err")
+	_tm=$(sed -n 's/^ext:.*timer \([0-9]*\)$/\1/p' "$TD/x.err")
+	_rows=$(grep -c . "$TD/x.out")
+}
+
+# eq NAME GOT WANT ...   a plain equality with a name on it
+#
+# The three values are copied out before the shift. The first version read
+# $2 and $3 after it, so the FAILURE branch died with "parameter not set"
+# under set -u and the whole suite stopped with no summary line -- which
+# t/mutants.sh scores as an unknown fail count rather than as the mutant
+# being caught. Found by planting one: a harness whose red path is itself
+# broken reports the wrong thing about every defect it meets.
+eq() {
+	_n=$1; _g=$2; _w=$3
+	shift 3
+	if [ "$_g" = "$_w" ]; then ok "$_n"
+	else bad "$_n" "got [$_g], wanted [$_w]" "$@"; fi
+}
+
+# The control. Without -m or -i the mask is zero, and a kernel that sent an
+# optional attribute unasked would show up here rather than being mistaken
+# for one that was requested. INET_DIAG_SKV6ONLY does arrive unasked on every
+# AF_INET6 socket, which is why "the kernel sends nothing unrequested" is NOT
+# the claim: the claim is about these four.
+ext_read -tux
+eq 'no -o -m -i: nothing optional arrives' \
+    "$_sk/$_cg/$_rq/$_tm" '0/0/0/0' \
+    "records: $_rec, rows: $_rows"
+
+# Each flag asks for its own attribute and not the other one, which is what
+# makes idiag_ext the thing doing the selecting rather than the kernel
+# volunteering everything.
+ext_read -t -m
+if [ "${_sk:-0}" -gt 0 ] && [ "$_cg" = 0 ]; then
+	ok "-m asks for the memory counters only ($_sk of $_rec records)"
+else
+	bad '-m asks for the memory counters only' \
+	    "skmem $_sk, cong $_cg, over $_rec records"
+fi
+ext_read -t -i
+if [ "${_cg:-0}" -gt 0 ] && [ "$_sk" = 0 ]; then
+	ok "-i asks for the congestion control name only ($_cg of $_rec records)"
+else
+	bad '-i asks for the congestion control name only' \
+	    "skmem $_sk, cong $_cg, over $_rec records"
+fi
+# udiag_show is the UNIX spelling of the same idea, and a different word in
+# the request struct, so it gets its own assertion rather than being assumed
+# to follow.
+ext_read -x -om
+if [ "${_rq:-0}" -gt 0 ] && [ "${_sk:-0}" -gt 0 ]; then
+	ok "udiag_show brings back rqlen and meminfo ($_rq and $_sk of $_rec)"
+else
+	bad 'udiag_show brings back rqlen and meminfo' \
+	    "rqlen $_rq, skmem $_sk, over $_rec records"
+fi
+
+# A decline, measured rather than inferred. INET_DIAG_CONG is requested for
+# every UDP socket here and the kernel answers for none of them, because a
+# UDP socket has no congestion control to report. That is not a disagreement
+# with ss, which prints nothing there either, and the differential above
+# passes on those rows for the right reason only because this says the count
+# is zero on purpose.
+ext_read -u -i
+if [ "${_rec:-0}" -gt 0 ] && [ "$_cg" = 0 ]; then
+	ok "the kernel declines INET_DIAG_CONG for all $_rec udp sockets"
+elif [ "${_rec:-0}" -eq 0 ]; then
+	skipt 'the kernel declines INET_DIAG_CONG for udp' 'no udp sockets'
+else
+	bad 'the kernel declines INET_DIAG_CONG for udp' \
+	    "$_cg of $_rec udp records carried one; this kernel is not the" \
+	    "one the README describes"
+fi
+
+# The counters and the listing have to be two facts about one dump, which is
+# why both come out of a single invocation. Taking them from two runs is the
+# defect the filter's record-count assertion already had once: ordinary churn
+# makes them differ and the message accuses sockv of the thing the assertion
+# exists to catch.
+ext_read -tux -omi
+_nsk=$(awk '$(NF-1) != "skmem:-"' "$TD/x.out" | grep -c .)
+_ncg=$(awk '$NF != "cong:-"' "$TD/x.out" | grep -c .)
+_ntm=$(awk '$(NF-2) != "timer:-" && $(NF-2) !~ /^timer:\(off,/' "$TD/x.out" |
+    grep -c .)
+eq "skmem arrivals equal the rows showing one ($_sk)" "$_sk" "$_nsk"
+eq "cong arrivals equal the rows showing one ($_cg)" "$_cg" "$_ncg"
+eq "timer count equals the rows with a timer running ($_tm)" "$_tm" "$_ntm"
+
+# Which sockets the kernel declined, and why it is a coherent answer rather
+# than a gap. A TIME-WAIT entry and a half-open SYN-RECV request socket have
+# no full struct sock behind them, so there is no memory accounting and no
+# congestion control to report -- the same reason both already report inode 0
+# and uid 0. Every declining inet row must be one of those two.
+_dstates=$(awk '$1 != "unix" && $(NF-1) == "skmem:-" {print $3}' "$TD/x.out" |
+    sort -u | tr '\n' ' ')
+_nd=$(awk '$1 != "unix" && $(NF-1) == "skmem:-"' "$TD/x.out" | grep -c .)
+if [ "$_nd" -eq 0 ]; then
+	skipt 'the inet sockets that declined are the ones with no struct sock' \
+	    'no socket on this machine declined, so there is nothing to classify'
+elif [ -z "$(printf '%s' "$_dstates" | tr ' ' '\n' |
+             grep -vx 'TIME-WAIT\|SYN-RECV\|')" ]; then
+	ok "the $_nd inet socket(s) that declined are in state(s): $_dstates"
+else
+	bad 'the inet sockets that declined are the ones with no struct sock' \
+	    "states that declined: $_dstates"
+fi
+
+# A UNIX socket has no timer and no congestion control in the interface at
+# all, which is a different thing again from an attribute the kernel chose
+# not to send, and the column says so on every row rather than on some of
+# them.
+if [ -z "$(awk '$1 == "unix" &&
+                ($(NF-2) != "timer:-" || $NF != "cong:-")' "$TD/x.out")" ]; then
+	ok 'unix_diag has no timer and no congestion control, on every row'
+else
+	bad 'unix_diag has no timer and no congestion control, on every row' \
+	    "$(awk '$1 == "unix" && ($(NF-2) != "timer:-" || $NF != "cong:-")' \
+	        "$TD/x.out" | head -5 | sed 's/^/  /')"
+fi
+
+# ===========================================================================
 # the record walker, driven with bytes no kernel would send
 # ===========================================================================
 # This is the other half of the oracle and it is not a differential: the
@@ -297,9 +611,12 @@ command -v timeout >/dev/null 2>&1 && TO="timeout 10"
 if [ ! -x "$P" ]; then
 	skipt 'record walker fixtures' 'run make: t/probe is not built'
 else
-	# pok NAME PROTO CASE ROW...   exit 0 and exactly these rows
-	pok() {
-		_n=$1; _p=$2; _c=$3; shift 3
+	# pokf FLAGS NCOLS NAME PROTO CASE ROW...   exit 0 and exactly these
+	# rows, comparing NCOLS columns of each and passing FLAGS to sockv.
+	# The columns -o, -m and -i add sit past the seventh and are only
+	# printed when their flag is given, so those cases need both.
+	pokf() {
+		_f=$1; _k=$2; _n=$3; _p=$4; _c=$5; shift 5
 		if ! "$P" emit "$_c" "$TD/f.bin" 2>"$TD/e"; then
 			bad "$_n" "probe emit $_c failed" "$(cat "$TD/e")"
 			return
@@ -310,26 +627,36 @@ else
 		# pok cases. A binary whose *successful* --parse returned 2
 		# passed every one of them; only the separate
 		# `t '--parse of an empty file' 0` noticed.
-		$TO "$S" --parse "$_p" "$TD/f.bin" >"$TD/p.out" 2>"$TD/e"
+		$TO "$S" $_f --parse "$_p" "$TD/f.bin" >"$TD/p.out" 2>"$TD/e"
 		_s=$?
-		_got=$(awk 'NF {print $1, $2, $3, $4, $5, $6, $7}' "$TD/p.out")
+		_got=$(awk -v k="$_k" 'NF {
+			s = $1
+			for (i = 2; i <= k; i++) s = s " " $i
+			print s
+		}' "$TD/p.out")
 		_want=$(printf '%s\n' "$@")
 		if [ "$_s" -eq 0 ] && [ "$_got" = "$_want" ]; then ok "$_n"
 		else bad "$_n" "want exit 0 and" "$_want" \
 		         "got exit $_s and" "$_got" "$(cat "$TD/e")"; fi
 	}
 
+	# pok NAME PROTO CASE ROW...   the seven columns of the default row
+	pok() { _n=$1; _p=$2; _c=$3; shift 3; pokf '' 7 "$_n" "$_p" "$_c" "$@"; }
+
 	# pbad NAME PROTO CASE WANT_STATUS MSG   nonzero exit, and the
 	# diagnostic must name the field that was wrong -- a test that only
 	# checks the status cannot tell one bounds check from another, or from
 	# a typo in the parser.
+	# A sixth argument, when given, is extra flags for sockv: the
+	# extension attributes are only read when -o, -m or -i asked for them,
+	# so a reply that lies about one of their lengths is only refused then.
 	pbad() {
-		_n=$1; _p=$2; _c=$3; _w=$4; _m=$5
+		_n=$1; _p=$2; _c=$3; _w=$4; _m=$5; _f=${6-}
 		if ! "$P" emit "$_c" "$TD/f.bin" 2>"$TD/e"; then
 			bad "$_n" "probe emit $_c failed" "$(cat "$TD/e")"
 			return
 		fi
-		_e=$($TO "$S" --parse "$_p" "$TD/f.bin" 2>&1 >/dev/null)
+		_e=$($TO "$S" $_f --parse "$_p" "$TD/f.bin" 2>&1 >/dev/null)
 		_s=$?
 		if sanitizer_fired "$_e"
 		then bad "$_n" "a sanitizer fired" "$_e"
@@ -392,6 +719,46 @@ else
 	    'unix u_str LISTEN /run/ab.sock:5003 *:0 5003 0' \
 	    'unix u_str LISTEN /run/c.sock:5004 *:0 5004 1001'
 
+	# --- the optional extension columns, pinned to known values -----
+	# Three outcomes to keep apart, and the fixtures are the only place
+	# all three can be put side by side on demand.
+	#
+	# The attribute arrived: ext-full carries a full SK_MEMINFO array, a
+	# congestion control name of "bbr" and a zero-window-probe timer, none
+	# of which any socket on this machine has.
+	#
+	# The kernel declined: the v4 fixture carries no extension attribute
+	# at all, which is what a TIME-WAIT entry sends, and the columns read
+	# "-" rather than zero. A zero is a value the kernel reported; "-" is
+	# the kernel not reporting one.
+	#
+	# Refused on our side: an attribute too short to hold what it claims
+	# to be. Those are the pbad cases below.
+	pokf '-omi' 12 'extension columns, every one populated' tcp ext-full \
+	    'inet tcp ESTAB 127.0.0.1:8080 10.0.0.1:443 4260 1001 111 222 timer:(persist,3456ms,7) skmem:(r1,rb2,t3,tb4,f5,w6,o7,bl8,d9) cong:bbr'
+	pokf '-omi' 12 'an extension the kernel did not send reads as -' tcp v4 \
+	    'inet tcp ESTAB 127.0.0.1:8080 10.0.0.1:443 4242 1001 0 0 timer:(off,0ms,0) skmem:- cong:-'
+	# A timer number past the end of ss's table, the same argument as the
+	# unknown state: name it and keep the socket.
+	pokf '-o' 10 'a timer number this build does not know' tcp \
+	    ext-timer-unknown \
+	    'inet tcp ESTAB 127.0.0.1:8080 10.0.0.1:443 4261 1001 0 0 timer:(unknown,1ms,0)'
+	# A longer array than this build knows is a newer kernel, read to the
+	# width we have. A shorter one is a reply lying about its own length.
+	pokf '-m' 8 'more memory counters than this build knows' tcp \
+	    ext-skmem-wide \
+	    'inet tcp ESTAB 127.0.0.1:8080 10.0.0.1:443 4262 1001 skmem:(r1,rb2,t3,tb4,f5,w6,o7,bl8,d9)'
+	pokf '-o' 10 'unix queue lengths come from UNIX_DIAG_RQLEN' unix \
+	    ext-unix-rqlen \
+	    'unix u_str LISTEN /run/probe.sock:4266 *:0 4266 1001 77 88 timer:-'
+	# Without the flag the attribute is never read, so the same bytes that
+	# are refused below are listed without complaint here. The refusal is
+	# scoped to what is actually parsed, which is why each of those cases
+	# names the flag that reaches it.
+	pok 'a short memory array nobody asked for is not read' tcp \
+	    ext-skmem-short \
+	    'inet tcp ESTAB 127.0.0.1:8080 10.0.0.1:443 4263 1001'
+
 	# --- malformed: refused, by name --------------------------------
 	pbad 'buffer shorter than an nlmsghdr' tcp short-buffer 2 \
 	    '9 trailing bytes, too few for an nlmsghdr'
@@ -409,6 +776,13 @@ else
 	    '7 trailing bytes, too few for an nlmsghdr'
 	pbad 'payload too small for inet_diag_msg' tcp payload-short 2 \
 	    'carries 8 payload bytes, inet_diag_msg needs 72'
+	# The same bytes read as a unix_diag reply. Both handlers bound the
+	# payload against the struct they are about to copy out of it, and
+	# until this was here only the inet one was covered: the mutation
+	# sweep listed one 'payload size check deleted' hitting both call
+	# sites at once, so it could not say which half the suite could see.
+	pbad 'payload too small for unix_diag_msg' unix payload-short 2 \
+	    'unix_diag_msg needs 16'
 	pbad 'nla_len below the attribute header' tcp attr-len-under 2 \
 	    'nla_len 2 is below the 4-byte attribute header'
 	pbad 'nla_len past the end of its message' tcp attr-len-over 2 \
@@ -423,6 +797,26 @@ else
 	    'idiag_family 99 is neither AF_INET'
 	pbad 'nlmsg_type we never asked for' tcp unknown-msg-type 2 \
 	    'unexpected nlmsg_type 1234'
+	# The extension attributes, each refused only when the flag that
+	# reads it was given. Same rule as everywhere else here: an unknown
+	# attribute TYPE is ignored because the kernel's enum grows, and an
+	# unknown LENGTH is refused because it cannot be interpreted at all.
+	pbad 'memory array shorter than SK_MEMINFO_VARS' tcp ext-skmem-short 2 \
+	    'the 9 SK_MEMINFO_VARS counters need 36' '-m'
+	# The same array with nothing after it in the reply, which is the
+	# fixture shape AddressSanitizer needs: with a NLMSG_DONE record
+	# following, the overread a deleted check produces lands inside the
+	# same allocation and the sanitizer sees nothing. Measured both ways
+	# and written down in the README.
+	pbad 'memory array shorter than its claim, and last in the reply' \
+	    tcp ext-skmem-short-last 2 \
+	    'the 9 SK_MEMINFO_VARS counters need 36' '-m'
+	pbad 'congestion control name with no terminator' tcp ext-cong-empty 2 \
+	    'attribute 4 is empty' '-i'
+	pbad 'congestion control name too long to hold' tcp ext-cong-long 2 \
+	    'carries 40 bytes; a congestion control name holds at most 31' '-i'
+	pbad 'unix_diag_rqlen with one of its two counters' unix \
+	    ext-unix-rqlen-short 2 'unix_diag_rqlen needs 8' '-o'
 
 	# --- not malformed, but not a listing either --------------------
 	pbad 'NLMSG_ERROR is reported with its errno' tcp nlmsg-error 1 \
@@ -608,6 +1002,197 @@ else
 				skipt "created: $_tag" "$_rest" ;;
 			esac
 		done < "$TD/inv"
+
+		# ===============================================
+		# the extension columns, against values the probe
+		# knows before sockv is asked
+		# ===============================================
+		# The live differential can only compare two readings of a
+		# moving number. These sockets are the suite's own, nothing is
+		# sent on them, so their counters do not move -- and the
+		# numbers they must show come from somewhere other than
+		# netlink.
+		"$S" -tux -omi > "$TD/liveext"
+
+		# rb and tb are sk_rcvbuf and sk_sndbuf, which is the same
+		# pair of fields getsockopt(SO_RCVBUF) and
+		# getsockopt(SO_SNDBUF) read. So this compares a value that
+		# arrived as an optional netlink attribute against the same
+		# value fetched through a syscall that touches no netlink at
+		# all, on a socket whose identity is known.
+		while read -r _kw _tag _ino _rb _tb; do
+			[ "$_kw" = EXT ] || continue
+			_got=$(awk -v i="$_ino" '$(NF-6) == i { print $(NF-1) }' \
+			    "$TD/liveext")
+			_wnt="rb$_rb,"
+			case $_got in
+			*"$_wnt"*) ;;
+			*) bad "skmem rb/tb from getsockopt: $_tag" \
+			       "sockv says $_got, getsockopt says" \
+			       "rb$_rb and tb$_tb"
+			   continue ;;
+			esac
+			case $_got in
+			*",tb$_tb,"*) ok "skmem rb/tb from getsockopt: $_tag" ;;
+			*) bad "skmem rb/tb from getsockopt: $_tag" \
+			       "sockv says $_got, getsockopt says" \
+			       "rb$_rb and tb$_tb" ;;
+			esac
+		done < "$TD/inv"
+
+		# Send-Q on a listening socket is sk_max_ack_backlog, which is
+		# the number this program passed to listen(2) -- so unlike rb
+		# and tb this is not a second reading of a kernel value, it is
+		# a value the suite chose. Recv-Q is the number of connections
+		# waiting to be accepted, and nothing is connecting to these.
+		while read -r _kw _tag _ino _bl; do
+			[ "$_kw" = BACKLOG ] || continue
+			_got=$(awk -v i="$_ino" \
+			    '$(NF-6) == i { print $(NF-4), $(NF-3) }' \
+			    "$TD/liveext")
+			eq "listen backlog is Send-Q: $_tag" "$_got" "0 $_bl"
+		done < "$TD/inv"
+
+		# The timer. A column of timers over a corpus of sockets with
+		# none running is a column of zeroes that agrees with ss
+		# perfectly, so the probe arms one rather than hoping the
+		# machine has one: SO_KEEPALIVE with TCP_KEEPIDLE, the only
+		# timer reachable here without a privilege or a peer that
+		# stops answering.
+		_nka=0
+		while read -r _kw _tag _ino _ms; do
+			[ "$_kw" = KEEP ] || continue
+			_nka=$((_nka + 1))
+			_got=$(awk -v i="$_ino" '$(NF-6) == i { print $(NF-2) }' \
+			    "$TD/liveext")
+			# Not `set --`: that would overwrite the script's own
+			# positional parameters, and $1 here is which binary
+			# the whole suite is judging.
+			_tn=$(printf '%s' "$_got" | sed -n \
+			    's/^timer:(\([a-z]*\),[0-9]*ms,[0-9]*)$/\1/p')
+			_te=$(printf '%s' "$_got" | sed -n \
+			    's/^timer:([a-z]*,\([0-9]*\)ms,[0-9]*)$/\1/p')
+			_tr=$(printf '%s' "$_got" | sed -n \
+			    's/^timer:([a-z]*,[0-9]*ms,\([0-9]*\))$/\1/p')
+			if [ -z "$_tn" ] || [ -z "$_te" ] || [ -z "$_tr" ]; then
+				bad "keepalive timer: $_tag" \
+				    "sockv printed [$_got] for inode $_ino"
+				continue
+			fi
+			# The name and the retransmit count do not move. The
+			# expiry does, so it gets a bound and not an equality:
+			# it counts down from the TCP_KEEPIDLE this program
+			# set, and the probe holds its sockets for 30 seconds,
+			# so anything outside that window is sockv reading the
+			# wrong field or reading it the wrong way round.
+			if [ "$_tn" = keepalive ] && [ "$_tr" = 0 ] &&
+			   [ "$_te" -gt 0 ] && [ "$_te" -le "$_ms" ] &&
+			   [ "$_te" -gt "$((_ms > 30000 ? _ms - 30000 : 0))" ]
+			then
+				ok "keepalive timer: $_tag (${_te}ms of $_ms)"
+			else
+				bad "keepalive timer: $_tag" \
+				    "sockv says [$_got]; TCP_KEEPIDLE was" \
+				    "${_ms}ms and the hold window is 30s"
+			fi
+		done < "$TD/inv"
+		if [ "$_nka" -eq 0 ]; then
+			skipt 'keepalive timer' \
+			    'the probe could not arm one'
+		fi
+
+		# And the count, because every assertion above is about rows
+		# that exist. If no socket anywhere carried a timer, the
+		# timer column would agree with ss over nothing.
+		ext_read -tux -omi
+		if [ "${_tm:-0}" -gt 0 ]; then
+			ok "$_tm of $_rec records carried a timer"
+		else
+			bad 'some record carried a timer' \
+			    'the timer column agreed with ss over a corpus of' \
+			    'sockets that have no timer running, which it would' \
+			    'also do if the field were never read'
+		fi
+
+		# The expiry against ss, bracketed rather than equated. ss
+		# renders a remaining time under ten seconds to the
+		# millisecond and anything longer to the second or the
+		# minute, so this uses the socket the probe armed with a
+		# nine-second idle, and skips if ss rendered it coarsely
+		# anyway. The reading is sandwiched: ss, sockv, ss, and a
+		# countdown read in the middle must lie between the two.
+		# A keepalive timer that fires and re-arms inside the window
+		# makes the later reading the larger one, which is churn
+		# rather than disagreement, so that attempt is retried.
+		sstimer() {
+			ss -tuanoeH 2>/dev/null | awk -v i="ino:$1" '
+				{ t = ""; f = 0
+				  for (j = 1; j <= NF; j++) {
+					if ($j == i) f = 1
+					if ($j ~ /^timer:\(/) t = $j
+				  }
+				  if (f && t != "") {
+					sub(/^timer:\([^,]*,/, "", t)
+					sub(/,[0-9]*\)$/, "", t)
+					print t
+				  } }'
+		}
+		# ss's own rendering, converted back. Only the two exact forms
+		# are accepted: "235ms" and "4.886sec" are a value, while
+		# "11sec" is any value in a one-second range and "9min58sec"
+		# in a one-minute one, and a bound built out of a range that
+		# wide would pass for anything.
+		msof() {
+			awk -v t="$1" 'BEGIN {
+				if (t ~ /^[0-9]+ms$/) {
+					sub(/ms$/, "", t); print t + 0; exit
+				}
+				if (t ~ /^[0-9]+\.[0-9][0-9][0-9]sec$/) {
+					split(t, f, ".")
+					sub(/sec$/, "", f[2])
+					print f[1] * 1000 + f[2] + 0; exit
+				}
+				print -1 }'
+		}
+		_ka=$(awk '$1 == "KEEP" && $2 == "tcp4-server" {print $3}' \
+		    "$TD/inv")
+		if [ -z "$_ka" ] || [ "$HAVE_SS" = no ]; then
+			skipt 'the timer expiry is between two ss readings' \
+			    'no short-idle keepalive socket, or no ss(8)'
+		else
+			_try=0; _done=no; _why=
+			while [ "$_try" -lt 4 ] && [ "$_done" = no ]; do
+				_try=$((_try + 1))
+				_a=$(msof "$(sstimer "$_ka")")
+				# -omi and not -o alone: NF-6 is the inode
+				# only when all three columns are present.
+				_v=$("$S" -t -omi |
+				    awk -v i="$_ka" '$(NF-6) == i {
+					t = $(NF-2)
+					sub(/^timer:\([^,]*,/, "", t)
+					sub(/ms,[0-9]*\)$/, "", t)
+					print t }')
+				_b=$(msof "$(sstimer "$_ka")")
+				if [ "$_a" = -1 ] || [ "$_b" = -1 ]; then
+					_why='ss rendered the expiry coarsely'
+				elif [ -z "$_v" ]; then
+					_why='sockv did not report that socket'
+				elif [ "$_b" -gt "$_a" ]; then
+					_why='the timer re-armed inside the window'
+				elif [ "$_v" -le "$_a" ] && [ "$_v" -ge "$_b" ]
+				then
+					_done=yes
+				else
+					_why="sockv said ${_v}ms, ss said ${_a}ms then ${_b}ms"
+				fi
+			done
+			if [ "$_done" = yes ]; then
+				ok "the timer expiry is between two ss readings ($_b <= $_v <= $_a ms)"
+			else
+				bad 'the timer expiry is between two ss readings' \
+				    "after $_try attempts: $_why"
+			fi
+		fi
 
 		# A socket name with whitespace in it shifts every field after
 		# it, in sockv's output and in ss's alike, so this one is
@@ -902,6 +1487,36 @@ else
 			fi
 		fi
 
+		# A bytecode attribute and a nonzero idiag_ext travel in the
+		# same request struct, and the attribute offset is computed
+		# from the end of that struct, so the two are not obviously
+		# independent. Same filter with and without -m must select
+		# the same sockets, and the extension must still come back.
+		# EXPECT tag fam netid state local peer inode uid, so the
+		# local endpoint is the sixth field and the port is what
+		# follows its last colon.
+		_pf=$(awk -v t=tcp4-listen \
+		    '$1 == "EXPECT" && $2 == t { print $6 }' "$TD/inv" |
+		    sed 's/.*://')
+		if [ -z "$_pf" ]; then
+			skipt 'a filter and an extension in one request' \
+			    'the probe could not bind its listener'
+		else
+			ext_read -t --port "$_pf" -m
+			_f1=$(awk '{ print $6 }' "$TD/x.out" | sort)
+			_f2=$("$S" -t --port "$_pf" | awk '{ print $6 }' | sort)
+			if [ "$_f1" = "$_f2" ] && [ "${_sk:-0}" -gt 0 ] &&
+			   [ "${_rec:-0}" -gt 0 ] && [ "$_rec" = "$_rows" ]
+			then
+				ok "a filter and an extension in one request ($_rec records, skmem $_sk)"
+			else
+				bad 'a filter and an extension in one request' \
+				    "with -m: $_rec records, $_rows rows, skmem $_sk" \
+				    "inodes with -m: $(printf '%s' "$_f1" | tr '\n' ' ')" \
+				    "inodes without:  $(printf '%s' "$_f2" | tr '\n' ' ')"
+			fi
+		fi
+
 		# unix_diag has no bytecode, so the combination is refused
 		# rather than answered with sockets nobody filtered.
 		t '-x with a filter is refused'  3 -- "$S" -x --port 80
@@ -934,6 +1549,8 @@ t 'unknown option'            3  -- "$S" -Z
 t 'stray argument'            3  -- "$S" tcp
 t '--help exits 0'            0  -- "$S" --help
 t 'listing exits 0'           0  -- "$S" -tux
+t '-omi listing exits 0'      0  -- "$S" -tux -omi
+t '-m with -x is not refused' 0  -- "$S" -x -m
 
 printf '\n%d passed, %d failed, %d skipped\n' "$pass" "$fail" "$skip"
 [ "$fail" -eq 0 ]
