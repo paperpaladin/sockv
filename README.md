@@ -582,7 +582,7 @@ ok    listing exits 0
 ok    -omi listing exits 0
 ok    -m with -x is not refused
 
-187 passed, 0 failed, 1 skipped
+186 passed, 0 failed, 2 skipped
 ```
 
 Exit status is part of the interface, because the suite asserts on it: `0`
@@ -612,7 +612,7 @@ sites, which is the shape that once made a real defect look provably
 equivalent. `--check-quiet` is the form `make test` runs.
 
 ```
-ok     (no defect planted)                    187 passed, 0 failed, 1 skipped
+ok     (no defect planted)                    186 passed, 0 failed, 2 skipped
 
 ok     port printed without ntohs             caught by 51 assertion(s)
          tcp+udp, all states: ss agrees both ways
