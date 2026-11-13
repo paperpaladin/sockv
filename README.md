@@ -582,8 +582,26 @@ ok    listing exits 0
 ok    -omi listing exits 0
 ok    -m with -x is not refused
 
-186 passed, 0 failed, 2 skipped
+187 passed, 0 failed, 1 skipped
 ```
+
+Two summary lines are correct on this machine, and which one a run prints
+depends on what the kernel was holding when the dump happened:
+
+```
+187 passed, 0 failed, 1 skipped    some inet socket was in TIME-WAIT or SYN-RECV
+186 passed, 0 failed, 2 skipped    none was
+```
+
+A TIME-WAIT entry and a half-open SYN-RECV request socket have no full
+`struct sock` behind them, so the kernel declines `INET_DIAG_SKMEM` for both.
+The assertion that every declining inet row is in one of those two states has
+nothing to classify when the machine has neither, and reports itself skipped.
+`ss -H -tan state time-wait state syn-recv` counted 0 on this machine one
+second and 1 four seconds later, so both lines come up in ordinary use; two
+consecutive runs gave 186 and then 187. The other skip is permanent:
+`ss -e` does not report a uid for unix sockets, so there is nothing to compare
+sockv's against.
 
 Exit status is part of the interface, because the suite asserts on it: `0`
 listed, `1` a syscall failed or the kernel returned an error reply, `2` a
@@ -593,6 +611,15 @@ was wrong. `86` is reserved for the sanitizers, see below.
 If `sock_diag` is unreachable, or `ss` is not installed, or `/proc/net` is not
 readable, the affected assertions are reported as skipped, with the kernel
 version and the reason. A skip is never dressed up as a pass.
+
+The corpus is this machine's live sockets, so the other question is what the
+suite does where there are none. Measured rather than argued: a clone run
+under `unshare -rn`, which is a network namespace with nothing in it, prints
+`153 passed, 18 failed, 14 skipped` and exits 1. Each of the 18 is a floor,
+`compared 0 sockets (>= 4)` and the like, beside a comparison that agreed
+about an empty set. The suite cannot report a smaller number quietly, which
+is the failure mode that matters when the corpus comes off the machine
+instead of out of the repository.
 
 ## Have I watched this harness fail?
 
@@ -612,7 +639,7 @@ sites, which is the shape that once made a real defect look provably
 equivalent. `--check-quiet` is the form `make test` runs.
 
 ```
-ok     (no defect planted)                    186 passed, 0 failed, 2 skipped
+ok     (no defect planted)                    187 passed, 0 failed, 1 skipped
 
 ok     port printed without ntohs             caught by 51 assertion(s)
          tcp+udp, all states: ss agrees both ways
